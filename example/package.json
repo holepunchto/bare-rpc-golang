@@ -1,0 +1,12 @@
+{
+  "dependencies": {
+    "bare-fs": "^4.5.2",
+    "bare-ipc": "^1.1.1",
+    "bare-net": "^2.2.0",
+    "bare-pipe": "^4.1.2",
+    "bare-process": "^4.2.2",
+    "bare-rpc": "^1.1.0",
+    "compact-encoding": "^2.18.0",
+    "streamx": "^2.23.0"
+  }
+}
