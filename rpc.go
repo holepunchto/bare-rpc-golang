@@ -1,7 +1,6 @@
 package bare_rpc
 
 import (
-	"fmt"
 	"io"
 	"sync"
 
@@ -186,7 +185,6 @@ func (r *RPC) Listen(onRequest func(msg *Request)) error {
 			ch, ok := r.outgoingRequests[msg.ID]
 			r.mu.Unlock()
 			if ok {
-				fmt.Println("response", msg)
 				ch <- msg
 			}
 

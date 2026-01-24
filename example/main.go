@@ -1,54 +1,64 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/exec"
 	"time"
 
+	"github.com/charmbracelet/bubbles/list"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"holepunch.to/bare_rpc"
 	c "holepunch.to/compactencoding"
 )
 
-type BareMessage struct {
-	Type  int
-	Value string
+type Item struct {
+	title string
+	desc  string
 }
 
-type BareMessageEncoding struct{}
+type ItemEncoding struct{}
 
-func (m *BareMessageEncoding) Preencode(state *c.State, msg *BareMessage) {
-	c.NewInt().Preencode(state, msg.Type)
-	c.NewString().Preencode(state, msg.Value)
+func (m *ItemEncoding) Preencode(state *c.State, msg *Item) {
+	c.NewString().Preencode(state, msg.title)
+	c.NewString().Preencode(state, msg.desc)
 }
 
-func (m *BareMessageEncoding) Encode(state *c.State, msg *BareMessage) error {
-	if err := c.NewInt().Encode(state, msg.Type); err != nil {
+func (m *ItemEncoding) Encode(state *c.State, msg *Item) error {
+	if err := c.NewString().Encode(state, msg.title); err != nil {
 		return err
 	}
-	if err := c.NewString().Encode(state, msg.Value); err != nil {
+	if err := c.NewString().Encode(state, msg.desc); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (m *BareMessageEncoding) Decode(state *c.State) (*BareMessage, error) {
+func (m *ItemEncoding) Decode(state *c.State) (*Item, error) {
 	var err error
-	msg := &BareMessage{}
+	msg := &Item{}
 
-	if msg.Type, err = c.NewInt().Decode(state); err != nil {
+	if msg.title, err = c.NewString().Decode(state); err != nil {
 		return nil, err
 	}
-	if msg.Value, err = c.NewString().Decode(state); err != nil {
+	if msg.desc, err = c.NewString().Decode(state); err != nil {
 		return nil, err
 	}
 
 	return msg, nil
 }
 
-func main() {
+type BareRPCSock struct {
+	*bare_rpc.RPC
+	path string
+	conn net.Conn
+}
+
+func NewBareRPCSock() *BareRPCSock {
 	socketPath := "/tmp/bare-rpc.sock"
 
 	// Remove old socket if exists
@@ -74,26 +84,87 @@ func main() {
 	if err != nil {
 		log.Fatalf("dial error: %v", err)
 	}
-	defer conn.Close()
 
 	rpc := bare_rpc.NewRPC(conn)
 
-	go func() {
-		time.Sleep(50 * time.Millisecond)
+	return &BareRPCSock{
+		rpc,
+		socketPath,
+		conn,
+	}
+}
 
-		response, err := rpc.Request(42, []byte("hello from Go"))
-		if err != nil {
-			log.Fatalf("Go: request error: %v", err)
+func (b *BareRPCSock) Stop() {
+	b.conn.Close()
+	os.Remove(b.path)
+}
+
+var docStyle = lipgloss.NewStyle().Margin(1, 2)
+
+func (i Item) Title() string       { return i.title }
+func (i Item) Description() string { return i.desc }
+func (i Item) FilterValue() string { return i.title }
+
+type model struct {
+	list list.Model
+	rpc  *BareRPCSock
+}
+
+func (m model) Init() tea.Cmd {
+	return nil
+}
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		if msg.String() == "ctrl+c" {
+			return m, tea.Quit
 		}
+	case tea.WindowSizeMsg:
+		h, v := docStyle.GetFrameSize()
+		m.list.SetSize(msg.Width-h, msg.Height-v)
+	}
 
-		log.Printf("Go: got response: %s\n", string(response))
+	var cmd tea.Cmd
+	m.list, cmd = m.list.Update(msg)
+	return m, cmd
+}
+
+func (m model) View() string {
+	return docStyle.Render(m.list.View())
+}
+
+func main() {
+	rpc := NewBareRPCSock()
+	defer rpc.Stop()
+
+	go func() {
+		rpc.Listen(func(msg *bare_rpc.Request) {
+			log.Printf("Go: got request: %v\n", msg)
+		})
 	}()
 
-	err = rpc.Listen(func(req *bare_rpc.Request) {
-		msg, err := c.Decode(&BareMessageEncoding{}, req.Data)
-		log.Println(msg.Value, err)
-	})
+	buf, err := rpc.Request(0, []byte{})
 	if err != nil {
-		log.Printf("Go: HandleMessages error: %v", err)
+		log.Println("Request failed", err)
+	}
+	res, err := c.Decode(c.NewArray(&ItemEncoding{}), buf)
+	if err != nil {
+		log.Println("Request failed decode", err)
+	}
+
+	items := make([]list.Item, 0, len(res))
+	for _, item := range res {
+		items = append(items, item)
+	}
+
+	m := model{list: list.New(items, list.NewDefaultDelegate(), 0, 0)}
+	m.list.Title = "My Fave Things"
+
+	p := tea.NewProgram(m, tea.WithAltScreen())
+
+	if _, err := p.Run(); err != nil {
+		fmt.Println("Error running program:", err)
+		os.Exit(1)
 	}
 }
