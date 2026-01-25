@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 
-	c "holepunch.to/compactencoding"
+	c "github.com/holepunchto/compact-encoding-golang"
 )
 
 // Message types

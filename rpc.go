@@ -4,7 +4,7 @@ import (
 	"io"
 	"sync"
 
-	c "holepunch.to/compactencoding"
+	c "github.com/holepunchto/compact-encoding-golang"
 )
 
 type RPC struct {

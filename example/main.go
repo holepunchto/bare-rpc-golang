@@ -11,8 +11,8 @@ import (
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	c "github.com/holepunchto/compact-encoding-golang"
 	"holepunch.to/bare_rpc"
-	c "holepunch.to/compactencoding"
 )
 
 type Item struct {
