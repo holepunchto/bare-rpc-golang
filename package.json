@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "hyperschema": "file:../hyperschema"
+  }
+}

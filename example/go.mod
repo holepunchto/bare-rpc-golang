@@ -9,7 +9,7 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/holepunchto/bare-rpc-golang v0.0.0-00010101000000-000000000000
-	github.com/holepunchto/compact-encoding-golang v1.0.0
+	github.com/holepunchto/compact-encoding-golang v1.0.1
 )
 
 require (

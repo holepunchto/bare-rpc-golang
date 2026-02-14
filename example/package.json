@@ -7,6 +7,8 @@
     "bare-process": "^4.2.2",
     "bare-rpc": "^1.1.0",
     "compact-encoding": "^2.18.0",
+    "hrpc": "^4.3.0",
+    "hyperschema": "file:../../hyperschema",
     "streamx": "^2.23.0"
   }
 }

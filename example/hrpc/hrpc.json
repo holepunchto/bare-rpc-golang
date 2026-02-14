@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "schema": [
+    {
+      "id": 0,
+      "name": "@example/hello",
+      "request": {
+        "name": "@example/hello-request"
+      },
+      "response": {
+        "name": "@example/hello-response"
+      },
+      "version": 1
+    }
+  ]
+}

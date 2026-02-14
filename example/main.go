@@ -8,49 +8,10 @@ import (
 	"os/exec"
 	"time"
 
-	"github.com/charmbracelet/bubbles/list"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	bare_rpc "github.com/holepunchto/bare-rpc-golang"
+	"github.com/holepunchto/bare-rpc-golang/example/schema"
 	c "github.com/holepunchto/compact-encoding-golang"
 )
-
-type Item struct {
-	title string
-	desc  string
-}
-
-type ItemEncoding struct{}
-
-func (m *ItemEncoding) Preencode(state *c.State, msg *Item) {
-	c.NewString().Preencode(state, msg.title)
-	c.NewString().Preencode(state, msg.desc)
-}
-
-func (m *ItemEncoding) Encode(state *c.State, msg *Item) error {
-	if err := c.NewString().Encode(state, msg.title); err != nil {
-		return err
-	}
-	if err := c.NewString().Encode(state, msg.desc); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (m *ItemEncoding) Decode(state *c.State) (*Item, error) {
-	var err error
-	msg := &Item{}
-
-	if msg.title, err = c.NewString().Decode(state); err != nil {
-		return nil, err
-	}
-	if msg.desc, err = c.NewString().Decode(state); err != nil {
-		return nil, err
-	}
-
-	return msg, nil
-}
 
 type BareRPCSock struct {
 	*bare_rpc.RPC
@@ -63,12 +24,9 @@ func NewBareRPCSock() *BareRPCSock {
 
 	// Remove old socket if exists
 	os.Remove(socketPath)
-	defer func() {
-		os.Remove(socketPath)
-	}()
 
 	// Start Bare server
-	cmd := exec.Command("bare", "server.js", socketPath)
+	cmd := exec.Command("bare", "hrpc-server.js", socketPath)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
@@ -99,72 +57,109 @@ func (b *BareRPCSock) Stop() {
 	os.Remove(b.path)
 }
 
-var docStyle = lipgloss.NewStyle().Margin(1, 2)
+// var docStyle = lipgloss.NewStyle().Margin(1, 2)
 
-func (i Item) Title() string       { return i.title }
-func (i Item) Description() string { return i.desc }
-func (i Item) FilterValue() string { return i.title }
+// func (i Item) Title() string       { return i.title }
+// func (i Item) Description() string { return i.desc }
+// func (i Item) FilterValue() string { return i.title }
 
-type model struct {
-	list list.Model
-	rpc  *BareRPCSock
+// type model struct {
+// 	list list.Model
+// 	rpc  *BareRPCSock
+// }
+
+// func (m model) Init() tea.Cmd {
+// 	return nil
+// }
+
+// func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+// 	switch msg := msg.(type) {
+// 	case tea.KeyMsg:
+// 		if msg.String() == "ctrl+c" {
+// 			return m, tea.Quit
+// 		}
+// 	case tea.WindowSizeMsg:
+// 		h, v := docStyle.GetFrameSize()
+// 		m.list.SetSize(msg.Width-h, msg.Height-v)
+// 	}
+
+// 	var cmd tea.Cmd
+// 	m.list, cmd = m.list.Update(msg)
+// 	return m, cmd
+// }
+
+// func (m model) View() string {
+// 	return docStyle.Render(m.list.View())
+// }
+
+type HRPCHandler[T any] struct {
+	onRequest func(data any) ([]byte, error)
+	encode    func(data any) ([]byte, error)
+	decode    func(data []byte) (any, error)
 }
 
-func (m model) Init() tea.Cmd {
-	return nil
-}
-
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		if msg.String() == "ctrl+c" {
-			return m, tea.Quit
-		}
-	case tea.WindowSizeMsg:
-		h, v := docStyle.GetFrameSize()
-		m.list.SetSize(msg.Width-h, msg.Height-v)
-	}
-
-	var cmd tea.Cmd
-	m.list, cmd = m.list.Update(msg)
-	return m, cmd
-}
-
-func (m model) View() string {
-	return docStyle.Render(m.list.View())
+type HRPC struct {
+	handlers map[uint]HRPCHandler[any]
 }
 
 func main() {
 	rpc := NewBareRPCSock()
 	defer rpc.Stop()
 
-	go func() {
-		rpc.Listen(func(msg *bare_rpc.Request) {
-			log.Printf("Go: got request: %v\n", msg)
-		})
-	}()
+	hrpc := &HRPC{
+		handlers: map[uint]HRPCHandler[any]{
+			0: {
+				onRequest: func(data any) ([]byte, error) {
+					log.Printf("Go: got request 0: %v\n", data.(*schema.ExampleHelloRequest))
 
-	buf, err := rpc.Request(0, []byte{})
-	if err != nil {
-		log.Println("Request failed", err)
+					return nil, nil
+				},
+				encode: func(data any) ([]byte, error) {
+					value := data.(*schema.ExampleHelloRequest)
+					state := c.NewState()
+					value.Preencode(state)
+					state.Allocate()
+					if err := value.Encode(state); err != nil {
+						return nil, err
+					}
+					return state.Buffer, nil
+				},
+				decode: func(data []byte) (any, error) {
+					var value schema.ExampleHelloRequest
+					state := c.NewState()
+					state.End = uint(len(data))
+					state.Buffer = data
+					if err := value.Decode(state); err != nil {
+						return nil, err
+					}
+					return &value, nil
+				},
+			},
+		},
 	}
-	res, err := c.Decode(c.NewArray(&ItemEncoding{}), buf)
-	if err != nil {
-		log.Println("Request failed decode", err)
-	}
 
-	items := make([]list.Item, 0, len(res))
-	for _, item := range res {
-		items = append(items, item)
-	}
+	rpc.Listen(func(msg *bare_rpc.Request) {
+		log.Printf("Go: got request: %v\n", msg.Data)
 
-	m := model{list: list.New(items, list.NewDefaultDelegate(), 0, 0)}
-	m.list.Title = "My Fave Things"
+		handler, ok := hrpc.handlers[msg.Command]
+		if !ok {
+			fmt.Printf("command not found: %v", msg.Command)
+			return
+		}
 
-	p := tea.NewProgram(m, tea.WithAltScreen())
+		data, err := handler.decode(msg.Data)
+		if err != nil {
+			fmt.Printf("failed to parse request for: %v: %v", msg.Command, err)
+		}
 
-	if _, err := p.Run(); err != nil {
-		fmt.Println("Error running program:", err)
-		os.Exit(1)
-	}
+		res, err := handler.onRequest(data)
+		if err != nil {
+			fmt.Printf("failed to handle request for: %v: %v", msg.Command, err)
+		}
+
+		err = msg.Reply(res)
+		if err != nil {
+			fmt.Printf("failed to send reply for: %v: %v", msg.Command, err)
+		}
+	})
 }

@@ -114,7 +114,7 @@ func (mc *MessageCodec) Preencode(state *c.State, m *Message) {
 		}
 
 	case TypeResponse:
-		c.NewBool().Preencode(state)
+		c.NewBool().Preencode(state, true)
 		c.NewUint().Preencode(state, m.Stream)
 		if m.Error != nil {
 			NewRPCErrorCodec().Preencode(state, m.Error)
