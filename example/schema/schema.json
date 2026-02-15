@@ -44,10 +44,11 @@
       "name": "hello-response",
       "namespace": "example",
       "compact": false,
-      "flagsPosition": 0,
+      "flagsPosition": -1,
       "fields": [
         {
           "name": "reply",
+          "required": true,
           "type": "string",
           "version": 1
         }

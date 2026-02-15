@@ -26,7 +26,7 @@ const server = net.createServer(async (socket) => {
     happy: true,
     dogs: ["one", "two"],
   });
-  console.log(res);
+  console.log("REPLY to bare", res);
 });
 
 server.listen(socketPath);

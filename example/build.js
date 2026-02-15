@@ -44,6 +44,7 @@ export const schema = Hyperschema.from("./schema", { import: false });
       {
         name: "reply",
         type: "string",
+        required: true,
       },
     ],
   });

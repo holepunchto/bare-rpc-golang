@@ -51,22 +51,16 @@ const encoding0 = {
 // @example/hello-response
 const encoding1 = {
   preencode(state, m) {
-    state.end++ // max flag is 1 so always one byte
-
-    if (m.reply) c.string.preencode(state, m.reply)
+    c.string.preencode(state, m.reply)
   },
   encode(state, m) {
-    const flags = m.reply ? 1 : 0
-
-    c.uint.encode(state, flags)
-
-    if (m.reply) c.string.encode(state, m.reply)
+    c.string.encode(state, m.reply)
   },
   decode(state) {
-    const flags = c.uint.decode(state)
+    const r0 = c.string.decode(state)
 
     return {
-      reply: (flags & 1) !== 0 ? c.string.decode(state) : null
+      reply: r0
     }
   }
 }

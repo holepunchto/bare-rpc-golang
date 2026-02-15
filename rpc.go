@@ -31,18 +31,16 @@ func (r *RPC) Send(m *Message) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	state := c.NewState()
-	r.messageCodec.Preencode(state, m)
-
-	state.Buffer = make([]byte, state.End)
-	state.Start = 0
-
-	if err := r.messageCodec.Encode(state, m); err != nil {
+	buf, err := c.Encode(&MessageCodec{}, m)
+	if err != nil {
 		return err
 	}
 
-	_, err := r.stream.Write(state.Buffer)
-	return err
+	if _, err := r.stream.Write(buf); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // Receive reads and decodes a message from the stream

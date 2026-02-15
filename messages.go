@@ -99,18 +99,18 @@ func NewMessageCodec() *MessageCodec {
 }
 
 func (mc *MessageCodec) Preencode(state *c.State, m *Message) {
-	// Frame length (fixed 4 bytes LE uint32)
-	state.End += 4
-
+	c.NewUint32().Preencode(state, 0)
 	c.NewUint().Preencode(state, m.Type)
 	c.NewUint().Preencode(state, m.ID)
+
+	hasData := false
 
 	switch m.Type {
 	case TypeRequest:
 		c.NewUint().Preencode(state, m.Command)
 		c.NewUint().Preencode(state, m.Stream)
 		if m.Stream == 0 {
-			c.NewBuffer().Preencode(state, m.Data)
+			hasData = true
 		}
 
 	case TypeResponse:
@@ -119,28 +119,31 @@ func (mc *MessageCodec) Preencode(state *c.State, m *Message) {
 		if m.Error != nil {
 			NewRPCErrorCodec().Preencode(state, m.Error)
 		} else if m.Stream == 0 {
-			c.NewBuffer().Preencode(state, m.Data)
+			hasData = true
 		}
 
 	case TypeStream:
 		c.NewUint().Preencode(state, m.Stream)
 		if m.Stream&StreamError != 0 {
 			NewRPCErrorCodec().Preencode(state, m.Error)
-		} else if m.Stream&StreamData != 0 {
-			c.NewBuffer().Preencode(state, m.Data)
+		} else if m.Stream == 0 {
+			hasData = true
 		}
+	}
+
+	if hasData {
+		c.NewUint().Preencode(state, uint(len(m.Data)))
 	}
 }
 
 func (mc *MessageCodec) Encode(state *c.State, m *Message) error {
 	var err error
 
-	// Remember where frame length goes
-	frameStart := state.Start
-	state.Start += 4
+	frame := state.Start
 
-	// Remember where payload starts
-	payloadStart := state.Start
+	c.NewUint32().Encode(state, 0) // Frame
+
+	start := state.Start
 
 	if err = c.NewUint().Encode(state, m.Type); err != nil {
 		return err
@@ -148,6 +151,8 @@ func (mc *MessageCodec) Encode(state *c.State, m *Message) error {
 	if err = c.NewUint().Encode(state, m.ID); err != nil {
 		return err
 	}
+
+	hasData := false
 
 	switch m.Type {
 	case TypeRequest:
@@ -158,9 +163,7 @@ func (mc *MessageCodec) Encode(state *c.State, m *Message) error {
 			return err
 		}
 		if m.Stream == 0 {
-			if err = c.NewBuffer().Encode(state, m.Data); err != nil {
-				return err
-			}
+			hasData = true
 		}
 
 	case TypeResponse:
@@ -175,9 +178,7 @@ func (mc *MessageCodec) Encode(state *c.State, m *Message) error {
 				return err
 			}
 		} else if m.Stream == 0 {
-			if err = c.NewBuffer().Encode(state, m.Data); err != nil {
-				return err
-			}
+			hasData = true
 		}
 
 	case TypeStream:
@@ -188,19 +189,27 @@ func (mc *MessageCodec) Encode(state *c.State, m *Message) error {
 			if err = NewRPCErrorCodec().Encode(state, m.Error); err != nil {
 				return err
 			}
-		} else if m.Stream&StreamData != 0 {
-			if err = c.NewBuffer().Encode(state, m.Data); err != nil {
-				return err
-			}
+		} else if m.Stream == 0 {
+			hasData = true
 		}
 	}
 
-	// Write frame length at the start (LE uint32)
-	frameLen := state.Start - payloadStart
-	state.Buffer[frameStart] = byte(frameLen)
-	state.Buffer[frameStart+1] = byte(frameLen >> 8)
-	state.Buffer[frameStart+2] = byte(frameLen >> 16)
-	state.Buffer[frameStart+3] = byte(frameLen >> 24)
+	if hasData {
+		if err = c.NewUint().Encode(state, uint(len(m.Data))); err != nil {
+			return err
+		}
+	}
+
+	end := state.Start
+	state.Start = frame
+
+	if err = c.NewUint32().Encode(state, uint32(end-start+uint(len(m.Data)))); err != nil {
+		return err
+	}
+
+	state.Start = end
+
+	state.Buffer = append(state.Buffer, m.Data...)
 
 	return nil
 }
@@ -259,7 +268,7 @@ func (mc *MessageCodec) Decode(state *c.State) (*Message, error) {
 				return nil, err
 			}
 		} else if m.Stream == 0 {
-			state.Start += 1 //? WHY?
+			// state.Start += 1 //? WHY?
 			if m.Data, err = c.NewBuffer().Decode(state); err != nil {
 				return nil, err
 			}

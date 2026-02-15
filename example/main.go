@@ -93,7 +93,7 @@ func (b *BareRPCSock) Stop() {
 // }
 
 type HRPCHandler[T any] struct {
-	onRequest func(data any) ([]byte, error)
+	onRequest func(data any) (any, error)
 	encode    func(data any) ([]byte, error)
 	decode    func(data []byte) (any, error)
 }
@@ -109,13 +109,15 @@ func main() {
 	hrpc := &HRPC{
 		handlers: map[uint]HRPCHandler[any]{
 			0: {
-				onRequest: func(data any) ([]byte, error) {
+				onRequest: func(data any) (any, error) {
 					log.Printf("Go: got request 0: %v\n", data.(*schema.ExampleHelloRequest))
 
-					return nil, nil
+					return &schema.ExampleHelloResponse{
+						Reply: "hello world!",
+					}, nil
 				},
 				encode: func(data any) ([]byte, error) {
-					value := data.(*schema.ExampleHelloRequest)
+					value := data.(*schema.ExampleHelloResponse)
 					state := c.NewState()
 					value.Preencode(state)
 					state.Allocate()
@@ -147,6 +149,8 @@ func main() {
 			return
 		}
 
+		fmt.Println("request ID", msg.ID)
+
 		data, err := handler.decode(msg.Data)
 		if err != nil {
 			fmt.Printf("failed to parse request for: %v: %v", msg.Command, err)
@@ -157,7 +161,13 @@ func main() {
 			fmt.Printf("failed to handle request for: %v: %v", msg.Command, err)
 		}
 
-		err = msg.Reply(res)
+		resEncoded, err := handler.encode(res)
+		if err != nil {
+			fmt.Printf("failed to encode response for: %v: %v", msg.Command, err)
+		}
+
+		fmt.Println("replying", resEncoded)
+		err = msg.Reply(resEncoded)
 		if err != nil {
 			fmt.Printf("failed to send reply for: %v: %v", msg.Command, err)
 		}
