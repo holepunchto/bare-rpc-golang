@@ -163,6 +163,10 @@ func (r *Request) Reply(data []byte) error {
 	return r.rpc.Reply(r.ID, data)
 }
 
+func (r *Request) ReplyError(err error) error {
+	return r.rpc.ReplyError(r.ID, err)
+}
+
 // HandleMessages reads messages and dispatches them
 // onRequest is called for incoming requests
 func (r *RPC) Listen(onRequest func(msg *Request)) error {
