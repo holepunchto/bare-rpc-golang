@@ -9,38 +9,81 @@ import (
 
 type RPC struct {
 	stream io.ReadWriter
-	mu     sync.Mutex
 
-	id               uint
-	outgoingRequests map[uint]chan *Message
-	messageCodec     *MessageCodec
+	// mu guards request ids and the stream/pending maps. It is held only
+	// briefly and never across a blocking write.
+	mu sync.Mutex
+	// writeMu serializes frame writes so encoded frames don't interleave on
+	// the wire. It is separate from mu so the read loop can keep dispatching
+	// (which needs mu) while another goroutine is blocked writing to a slow or
+	// synchronous transport.
+	writeMu sync.Mutex
+
+	id           uint
+	messageCodec *MessageCodec
+
+	// pending holds channels awaiting a unary response, keyed by request id.
+	pending map[uint]chan *Message
+
+	// Stream registries. The direction of a stream is the request id plus a
+	// direction mask (StreamRequest / StreamResponse); the operation flag tells
+	// whether the local end is the writer (outgoing*) or reader (incoming*).
+	outgoingRequests  map[uint]*OutgoingStream // request-stream writers (we initiated)
+	outgoingResponses map[uint]*OutgoingStream // response-stream writers (we handle)
+	incomingRequests  map[uint]*IncomingStream // request-stream readers (we handle)
+	incomingResponses map[uint]*IncomingStream // response-stream readers (we initiated)
+
+	// pendingOpen* remember an OPEN ack that arrived before the local writer
+	// was registered, so the handshake still completes (the writer checks
+	// these on creation). Mirrors bare-rpc's _pendingRequests/_pendingResponses.
+	pendingOpenRequests  map[uint]bool
+	pendingOpenResponses map[uint]bool
 }
 
 func NewRPC(stream io.ReadWriter) *RPC {
-	rpc := &RPC{
-		stream:           stream,
-		id:               0,
-		outgoingRequests: make(map[uint]chan *Message),
-		messageCodec:     NewMessageCodec(),
+	return &RPC{
+		stream:            stream,
+		id:                0,
+		messageCodec:      NewMessageCodec(),
+		pending:           make(map[uint]chan *Message),
+		outgoingRequests:  make(map[uint]*OutgoingStream),
+		outgoingResponses: make(map[uint]*OutgoingStream),
+		incomingRequests:  make(map[uint]*IncomingStream),
+		incomingResponses: make(map[uint]*IncomingStream),
+
+		pendingOpenRequests:  make(map[uint]bool),
+		pendingOpenResponses: make(map[uint]bool),
 	}
-	return rpc
 }
 
-// Send encodes and writes a message to the stream
+// Send encodes and writes a message to the stream. Encoding happens without any
+// lock; only the write itself is serialized (via writeMu), so the read loop can
+// keep dispatching while a write blocks on a slow/synchronous transport.
 func (r *RPC) Send(m *Message) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	buf, err := c.Encode(&MessageCodec{}, m)
 	if err != nil {
 		return err
 	}
 
-	if _, err := r.stream.Write(buf); err != nil {
-		return err
-	}
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
 
-	return nil
+	_, err = r.stream.Write(buf)
+	return err
+}
+
+// sendStream is a helper for stream control/data frames.
+func (r *RPC) sendStream(id, flags uint, data []byte) error {
+	return r.Send(&Message{Type: TypeStream, ID: id, Stream: flags, Data: data})
+}
+
+// sendStreamError sends a stream frame carrying an error (CLOSE|ERROR etc).
+func (r *RPC) sendStreamError(id, flags uint, cause error) error {
+	rpcErr := &RPCError{Message: cause.Error()}
+	if e, ok := cause.(*RPCError); ok {
+		rpcErr = e
+	}
+	return r.Send(&Message{Type: TypeStream, ID: id, Stream: flags | StreamError, Error: rpcErr})
 }
 
 // Receive reads and decodes a message from the stream
@@ -72,41 +115,16 @@ func (r *RPC) Receive() (*Message, error) {
 	return r.messageCodec.Decode(state)
 }
 
-// Request sends a request and returns the response
+// Request sends a request and returns the response (unary).
 func (r *RPC) Request(command uint, data []byte) ([]byte, error) {
-	r.mu.Lock()
-	r.id++
-	id := r.id
-	respChan := make(chan *Message, 1)
-	r.outgoingRequests[id] = respChan
-	r.mu.Unlock()
-
-	msg := &Message{
-		Type:    TypeRequest,
-		ID:      id,
-		Command: command,
-		Stream:  0,
-		Data:    data,
-	}
-
-	if err := r.Send(msg); err != nil {
+	req := r.NewRequest(command)
+	if err := req.Send(data); err != nil {
 		r.mu.Lock()
-		delete(r.outgoingRequests, id)
+		delete(r.pending, req.id)
 		r.mu.Unlock()
 		return nil, err
 	}
-
-	resp := <-respChan
-
-	r.mu.Lock()
-	delete(r.outgoingRequests, id)
-	r.mu.Unlock()
-
-	if resp.Error != nil {
-		return nil, resp.Error
-	}
-
-	return resp.Data, nil
+	return req.Reply()
 }
 
 // Event sends a one-way event (request with ID 0)
@@ -167,8 +185,32 @@ func (r *Request) ReplyError(err error) error {
 	return r.rpc.ReplyError(r.ID, err)
 }
 
-// HandleMessages reads messages and dispatches them
-// onRequest is called for incoming requests
+// CreateRequestStream opens the readable request stream (initiator -> handler).
+func (r *Request) CreateRequestStream() *IncomingStream {
+	s := newIncomingStream(r.rpc, r.ID, StreamRequest)
+
+	r.rpc.mu.Lock()
+	r.rpc.incomingRequests[r.ID] = s
+	r.rpc.mu.Unlock()
+
+	s.open()
+	return s
+}
+
+// CreateResponseStream opens the writable response stream (handler -> initiator).
+func (r *Request) CreateResponseStream() *OutgoingStream {
+	s := newOutgoingStream(r.rpc, r.ID, r.Command, TypeResponse, StreamResponse)
+
+	acked := r.rpc.registerOutgoing(r.ID, StreamResponse, s)
+	s.open()
+	if acked {
+		s.continueOpen()
+	}
+	return s
+}
+
+// Listen reads messages and dispatches them. onRequest is called for incoming
+// requests (including stream-opening requests, which carry no data).
 func (r *RPC) Listen(onRequest func(msg *Request)) error {
 	for {
 		msg, err := r.Receive()
@@ -183,15 +225,182 @@ func (r *RPC) Listen(onRequest func(msg *Request)) error {
 			}
 
 		case TypeResponse:
-			r.mu.Lock()
-			ch, ok := r.outgoingRequests[msg.ID]
-			r.mu.Unlock()
-			if ok {
-				ch <- msg
-			}
+			r.onResponse(msg)
 
 		case TypeStream:
-			// TODO: handle streaming
+			r.onStream(msg)
 		}
+	}
+}
+
+func (r *RPC) onResponse(msg *Message) {
+	if msg.ID == 0 {
+		return
+	}
+
+	r.mu.Lock()
+	ch, ok := r.pending[msg.ID]
+	r.mu.Unlock()
+	if !ok {
+		return
+	}
+
+	// A response with a stream flag set is just the response-stream OPEN
+	// signal; the unary waiter only resolves on an error or stream==0 reply.
+	if msg.Error != nil || msg.Stream == 0 {
+		ch <- msg
+	}
+}
+
+func (r *RPC) onStream(msg *Message) {
+	if msg.ID == 0 {
+		return
+	}
+
+	switch {
+	case msg.Stream&StreamOpen != 0:
+		r.onStreamOpen(msg)
+	case msg.Stream&StreamClose != 0:
+		r.onStreamClose(msg)
+	case msg.Stream&StreamPause != 0:
+		r.onStreamPause(msg)
+	case msg.Stream&StreamResume != 0:
+		r.onStreamResume(msg)
+	case msg.Stream&StreamData != 0:
+		r.onStreamData(msg)
+	case msg.Stream&StreamEnd != 0:
+		r.onStreamEnd(msg)
+	case msg.Stream&StreamDestroy != 0:
+		r.onStreamDestroy(msg)
+	}
+}
+
+func (r *RPC) onStreamOpen(msg *Message) {
+	r.mu.Lock()
+	var s *OutgoingStream
+	if msg.Stream&StreamRequest != 0 {
+		if s = r.outgoingRequests[msg.ID]; s == nil {
+			r.pendingOpenRequests[msg.ID] = true
+		}
+	} else if msg.Stream&StreamResponse != 0 {
+		if s = r.outgoingResponses[msg.ID]; s == nil {
+			r.pendingOpenResponses[msg.ID] = true
+		}
+	}
+	r.mu.Unlock()
+
+	if s != nil {
+		s.continueOpen()
+	}
+}
+
+// registerOutgoing records a writer and reports whether an OPEN ack already
+// arrived for it (in which case the caller should open the stream immediately).
+func (r *RPC) registerOutgoing(id, mask uint, s *OutgoingStream) (acked bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if mask&StreamRequest != 0 {
+		r.outgoingRequests[id] = s
+		acked = r.pendingOpenRequests[id]
+		delete(r.pendingOpenRequests, id)
+	} else {
+		r.outgoingResponses[id] = s
+		acked = r.pendingOpenResponses[id]
+		delete(r.pendingOpenResponses, id)
+	}
+	return acked
+}
+
+func (r *RPC) onStreamClose(msg *Message) {
+	s := r.incomingStream(msg.ID, msg.Stream)
+	if s == nil {
+		return
+	}
+	if msg.Error != nil {
+		s.destroyFromRemote(msg.Error)
+	} else {
+		s.pushEOF()
+	}
+}
+
+func (r *RPC) onStreamPause(msg *Message) {
+	if s := r.outgoingStream(msg.ID, msg.Stream); s != nil {
+		s.cork()
+	}
+}
+
+func (r *RPC) onStreamResume(msg *Message) {
+	if s := r.outgoingStream(msg.ID, msg.Stream); s != nil {
+		s.uncork()
+	}
+}
+
+func (r *RPC) onStreamData(msg *Message) {
+	if s := r.incomingStream(msg.ID, msg.Stream); s != nil {
+		s.push(msg.Data)
+	}
+}
+
+func (r *RPC) onStreamEnd(msg *Message) {
+	if s := r.incomingStream(msg.ID, msg.Stream); s != nil {
+		s.pushEOF()
+	}
+}
+
+func (r *RPC) onStreamDestroy(msg *Message) {
+	s := r.outgoingStream(msg.ID, msg.Stream)
+	if s == nil {
+		return
+	}
+	var err error
+	if msg.Error != nil {
+		err = msg.Error
+	}
+	s.destroyFromRemote(err)
+}
+
+// outgoingStream returns the writer registered for (id, direction), if any.
+func (r *RPC) outgoingStream(id, flags uint) *OutgoingStream {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if flags&StreamRequest != 0 {
+		return r.outgoingRequests[id]
+	}
+	if flags&StreamResponse != 0 {
+		return r.outgoingResponses[id]
+	}
+	return nil
+}
+
+// incomingStream returns the reader registered for (id, direction), if any.
+func (r *RPC) incomingStream(id, flags uint) *IncomingStream {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if flags&StreamRequest != 0 {
+		return r.incomingRequests[id]
+	}
+	if flags&StreamResponse != 0 {
+		return r.incomingResponses[id]
+	}
+	return nil
+}
+
+func (r *RPC) removeOutgoing(id, mask uint) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if mask&StreamRequest != 0 {
+		delete(r.outgoingRequests, id)
+	} else {
+		delete(r.outgoingResponses, id)
+	}
+}
+
+func (r *RPC) removeIncoming(id, mask uint) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if mask&StreamRequest != 0 {
+		delete(r.incomingRequests, id)
+	} else {
+		delete(r.incomingResponses, id)
 	}
 }

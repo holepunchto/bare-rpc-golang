@@ -21,7 +21,7 @@ go get github.com/holepunchto/bare-rpc-golang
 - ✅ Error handling with structured errors
 - ✅ Frame-based wire protocol
 - ✅ Wire-compatible with JavaScript bare-rpc
-- 🚧 Streaming support
+- ✅ Streaming support (request, response, and bidirectional) with flow control
 
 ## Quick Start
 
@@ -174,7 +174,18 @@ err := rpc.ReplyError(id uint, err error) error
 
 // Listen for incoming messages
 err := rpc.Listen(onRequest func(req *Request)) error
+
+// Build a request that can attach streams
+req := rpc.NewRequest(command uint) *OutgoingRequest
+req.Send(data []byte) error                       // unary payload
+data, err := req.Reply() ([]byte, error)          // await unary response
+ws := req.CreateRequestStream() *OutgoingStream   // io.WriteCloser (-> handler)
+rs := req.CreateResponseStream() *IncomingStream  // io.ReadCloser  (<- handler)
 ```
+
+On the handler side, the `*Request` passed to `Listen` exposes the mirror
+methods: `CreateRequestStream() *IncomingStream` (read what the initiator sends)
+and `CreateResponseStream() *OutgoingStream` (write the response stream).
 
 ### Listen
 
@@ -184,6 +195,50 @@ err := rpc.Listen(func(req *Request) {
 	err := req.Reply([]byte("Hello javascript!"))
 })
 ```
+
+## Streaming
+
+A request can carry up to two independent streams, identified by the request id
+plus a direction (request: initiator → handler, response: handler → initiator).
+The readable end implements `io.ReadCloser`; the writable end implements
+`io.WriteCloser`. Flow control (PAUSE/RESUME) is handled transparently — a slow
+reader signals the remote writer to back off.
+
+```go
+// Client: stream the request body up, await a unary reply
+req := rpc.NewRequest(2)
+ws := req.CreateRequestStream() // io.WriteCloser
+go func() {
+    io.Copy(ws, src) // stream bytes to the handler
+    ws.Close()       // END + CLOSE
+}()
+reply, err := req.Reply()
+
+// Client: send a request, stream the response back down
+req := rpc.NewRequest(1)
+req.Send(nil)
+rs := req.CreateResponseStream() // io.ReadCloser
+io.Copy(dst, rs)                 // read until EOF
+```
+
+```go
+// Handler
+rpc.Listen(func(req *bare_rpc.Request) {
+    switch req.Command {
+    case 1: // respond with a stream
+        out := req.CreateResponseStream() // io.WriteCloser
+        out.Write([]byte("chunk"))
+        out.Close()
+    case 2: // read a request stream, then reply
+        in := req.CreateRequestStream() // io.ReadCloser
+        data, _ := io.ReadAll(in)
+        req.Reply(data)
+    }
+})
+```
+
+Cross-runtime streaming is exercised against the JavaScript reference in
+`interop_test.go` (run with `go test -tags interop ./...`, requires `bare`).
 
 ## Transport
 

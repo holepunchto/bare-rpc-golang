@@ -126,7 +126,7 @@ func (mc *MessageCodec) Preencode(state *c.State, m *Message) {
 		c.NewUint().Preencode(state, m.Stream)
 		if m.Stream&StreamError != 0 {
 			NewRPCErrorCodec().Preencode(state, m.Error)
-		} else if m.Stream == 0 {
+		} else if m.Stream&StreamData != 0 {
 			hasData = true
 		}
 	}
@@ -189,13 +189,15 @@ func (mc *MessageCodec) Encode(state *c.State, m *Message) error {
 			if err = NewRPCErrorCodec().Encode(state, m.Error); err != nil {
 				return err
 			}
-		} else if m.Stream == 0 {
+		} else if m.Stream&StreamData != 0 {
 			hasData = true
 		}
 	}
 
+	dataLen := uint(0)
 	if hasData {
-		if err = c.NewUint().Encode(state, uint(len(m.Data))); err != nil {
+		dataLen = uint(len(m.Data))
+		if err = c.NewUint().Encode(state, dataLen); err != nil {
 			return err
 		}
 	}
@@ -203,13 +205,15 @@ func (mc *MessageCodec) Encode(state *c.State, m *Message) error {
 	end := state.Start
 	state.Start = frame
 
-	if err = c.NewUint32().Encode(state, uint32(end-start+uint(len(m.Data)))); err != nil {
+	if err = c.NewUint32().Encode(state, uint32(end-start+dataLen)); err != nil {
 		return err
 	}
 
 	state.Start = end
 
-	state.Buffer = append(state.Buffer, m.Data...)
+	if hasData {
+		state.Buffer = append(state.Buffer, m.Data...)
+	}
 
 	return nil
 }
@@ -283,7 +287,6 @@ func (mc *MessageCodec) Decode(state *c.State) (*Message, error) {
 				return nil, err
 			}
 		} else if m.Stream&StreamData != 0 {
-			state.Start += 1 //? WHY?
 			if m.Data, err = c.NewBuffer().Decode(state); err != nil {
 				return nil, err
 			}
