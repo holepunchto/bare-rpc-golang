@@ -499,3 +499,22 @@ func TestReplyContextCancel(t *testing.T) {
 		t.Fatal("cancelled request still pending")
 	}
 }
+
+func TestCloseFailsPendingAndClosesTransport(t *testing.T) {
+	client, server := newPair(t, func(req *Request) error { return nil }) // never replies
+
+	req := client.NewRequest(1)
+	if err := req.Send(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := req.Reply(); !errors.Is(err, ErrChannelClosed) {
+		t.Fatalf("Reply = %v, want ErrChannelClosed", err)
+	}
+	if _, err := client.Request(1, nil); !errors.Is(err, ErrChannelClosed) {
+		t.Fatalf("Request after Close = %v, want ErrChannelClosed", err)
+	}
+	waitIdle(t, "server", server)
+}

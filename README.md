@@ -185,6 +185,9 @@ err := rpc.Listen(onRequest func(req *Request) error) error
 // True when nothing is in flight (no pending reply, no open stream)
 idle := rpc.Idle() bool
 
+// Fail everything in flight with ErrChannelClosed and close the transport (if it is an io.Closer)
+err := rpc.Close() error
+
 // Largest frame body Receive will accept (default 16 MiB); set before Listen
 rpc.MaxFrameSize = 64 << 20
 
@@ -294,12 +297,23 @@ This library works with any `io.ReadWriter`, including:
 - In-memory buffers
 - Custom transports
 
-## Running the Example
+## Running the Examples
 
-The example demonstrates Go ↔ JavaScript RPC over Unix sockets:
+Go ↔ JavaScript RPC over a Unix socket path:
 
 ```bash
 cd example && npm i && go run .
+```
+
+The same over an inherited file descriptor (`example/pipe`): Go creates a Unix
+socketpair, passes the child's end through `cmd.ExtraFiles` so it lands as fd 3
+in Bare, and `pipe-server.js` opens it with `new Pipe(3)`. One catch: the `bare`
+command the npm package installs is a Node shim that respawns the runtime with
+only stdio 0-2, so fd 3 never reaches it. The example resolves the native binary
+behind the shim (or honours `BARE=/path/to/bare`).
+
+```bash
+cd example && go run ./pipe
 ```
 
 The example creates a TUI application that fetches a list of items from the JavaScript server and displays them using [Bubble Tea](https://github.com/charmbracelet/bubbletea).

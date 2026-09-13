@@ -267,6 +267,15 @@ func (r *RPC) handle(req *Request, onRequest func(*Request) error) {
 	}
 }
 
+// Close fails everything in flight with ErrChannelClosed and closes the transport when it is an io.Closer.
+func (r *RPC) Close() error {
+	r.teardown(ErrChannelClosed)
+	if closer, ok := r.stream.(io.Closer); ok {
+		return closer.Close()
+	}
+	return nil
+}
+
 // fail tears down from our side and closes the transport when it can be closed.
 func (r *RPC) fail(err error) {
 	r.teardown(err)
