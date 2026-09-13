@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -28,6 +29,7 @@ func startJSPeer(t *testing.T) *RPC {
 
 	cmd := exec.Command("bare", "stream-server.js", socketPath)
 	cmd.Dir = "example"
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // the npm bare shim respawns the runtime; kill both
 	// Capture (don't inherit) the child's stderr so killing it doesn't leave the
 	// test harness waiting on a shared fd; surface it only if the test fails.
 	var stderr bytes.Buffer
@@ -37,7 +39,7 @@ func startJSPeer(t *testing.T) *RPC {
 		t.Skipf("bare not runnable: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		_ = cmd.Wait()
 		if t.Failed() && stderr.Len() > 0 {
 			t.Logf("JS peer stderr:\n%s", stderr.String())
