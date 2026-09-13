@@ -1,0 +1,26 @@
+[
+  {
+    "hex": "04000000",
+    "reason": "frame length 4 but no body bytes follow (truncated)"
+  },
+  {
+    "hex": "020000006300",
+    "reason": "unknown message type 99"
+  },
+  {
+    "hex": "020000000107",
+    "reason": "request body ends after id: command runs past the end of the body"
+  },
+  {
+    "hex": "020000000201",
+    "reason": "response body ends after id: the error flag runs past the end of the body"
+  },
+  {
+    "hex": "03000000020101",
+    "reason": "error response body ends after the error flag: the message runs past the end of the body"
+  },
+  {
+    "hex": "02000000030a",
+    "reason": "stream body ends after the flags: the payload runs past the end of the body"
+  }
+]

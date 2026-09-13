@@ -20,8 +20,9 @@ go get github.com/holepunchto/bare-rpc-golang
 - ✅ One-way events
 - ✅ Error handling with structured errors
 - ✅ Frame-based wire protocol
-- ✅ Wire-compatible with JavaScript bare-rpc
+- ✅ Wire-compatible with JavaScript bare-rpc (tracked against 1.3.8, verified with the [hrpc-test](https://github.com/holepunchto/hrpc-test) vectors)
 - ✅ Streaming support (request, response, and bidirectional) with flow control
+- ✅ Channel teardown: when the transport ends or fails, pending replies and open streams fail instead of hanging
 
 ## Quick Start
 
@@ -43,12 +44,13 @@ func main() {
     
     rpc := bare_rpc.NewRPC(conn)
     
-    // Handle incoming requests
-    rpc.Listen(func(req *bare_rpc.Request) {
+    // Handle incoming requests. A returned error becomes the error reply.
+    rpc.Listen(func(req *bare_rpc.Request) error {
         switch req.Command {
         case 0:
-            req.Reply([]byte("Hello from Go!"))
+            return req.Reply([]byte("Hello from Go!"))
         }
+        return &bare_rpc.RPCError{Message: "unknown command", Code: "UNKNOWN"}
     })
 }
 ```
@@ -172,13 +174,25 @@ err := rpc.Reply(id uint, data []byte) error
 // Send error response
 err := rpc.ReplyError(id uint, err error) error
 
-// Listen for incoming messages
-err := rpc.Listen(onRequest func(req *Request)) error
+// Listen for incoming messages until the transport ends or fails. Everything
+// still in flight is then failed: a clean end surfaces to waiters as
+// bare_rpc.ErrChannelClosed (code CHANNEL_CLOSED), an error as that error.
+// The handler runs on its own goroutine per request. Returning an error sends
+// it as the error reply (unless a reply was already started); for an event,
+// which cannot be replied to, it fails the channel like bare-rpc does.
+err := rpc.Listen(onRequest func(req *Request) error) error
+
+// True when nothing is in flight (no pending reply, no open stream)
+idle := rpc.Idle() bool
+
+// Largest frame body Receive will accept (default 16 MiB); set before Listen
+rpc.MaxFrameSize = 64 << 20
 
 // Build a request that can attach streams
 req := rpc.NewRequest(command uint) *OutgoingRequest
 req.Send(data []byte) error                       // unary payload
 data, err := req.Reply() ([]byte, error)          // await unary response
+data, err := req.ReplyContext(ctx) ([]byte, error) // same, giving up when ctx is done
 ws := req.CreateRequestStream() *OutgoingStream   // io.WriteCloser (-> handler)
 rs := req.CreateResponseStream() *IncomingStream  // io.ReadCloser  (<- handler)
 ```
@@ -187,12 +201,27 @@ On the handler side, the `*Request` passed to `Listen` exposes the mirror
 methods: `CreateRequestStream() *IncomingStream` (read what the initiator sends)
 and `CreateResponseStream() *OutgoingStream` (write the response stream).
 
+Errors cross the wire as `*RPCError{Message, Code, Errno}`. `ReplyError` and
+`Destroy` send an `*RPCError` (even when wrapped) with its code and errno intact;
+any other error goes over with just its message. On the receiving side the
+error comes back as an `*RPCError`, so `errors.As` recovers the code.
+
+Both stream ends can abort with a reason: `OutgoingStream.Destroy(err)` sends
+`CLOSE|ERROR` to the reader, `IncomingStream.Destroy(err)` sends `DESTROY|ERROR`
+to the writer. `Close()` on either end is the graceful form.
+
+`IncomingStream.Read` is a plain byte reader. When every `Write` on the other
+end is one encoded message (as hrpc does), use `ReadChunk()` to get each DATA
+frame back whole instead.
+
 ### Listen
 
 ```go
-err := rpc.Listen(func(req *Request) {
-	// Reply to this request
-	err := req.Reply([]byte("Hello javascript!"))
+err := rpc.Listen(func(req *Request) error {
+	if req.IsEvent() { // id 0: one-way, nothing awaits a reply
+		return nil
+	}
+	return req.Reply([]byte("Hello javascript!"))
 })
 ```
 
@@ -223,22 +252,37 @@ io.Copy(dst, rs)                 // read until EOF
 
 ```go
 // Handler
-rpc.Listen(func(req *bare_rpc.Request) {
+rpc.Listen(func(req *bare_rpc.Request) error {
     switch req.Command {
     case 1: // respond with a stream
         out := req.CreateResponseStream() // io.WriteCloser
         out.Write([]byte("chunk"))
-        out.Close()
+        return out.Close()
     case 2: // read a request stream, then reply
         in := req.CreateRequestStream() // io.ReadCloser
-        data, _ := io.ReadAll(in)
-        req.Reply(data)
+        data, err := io.ReadAll(in)
+        if err != nil {
+            return err
+        }
+        return req.Reply(data)
     }
+    return nil
 })
 ```
 
-Cross-runtime streaming is exercised against the JavaScript reference in
-`interop_test.go` (run with `go test -tags interop ./...`, requires `bare`).
+## Compatibility testing
+
+Two suites pin wire compatibility with the JavaScript reference:
+
+- `vectors_test.go` runs the shared [hrpc-test](https://github.com/holepunchto/hrpc-test)
+  conformance vectors vendored under `testdata/hrpc-test/` (see `VERSION` there).
+  Every fixture frame must decode to its descriptor and re-encode byte for byte;
+  malformed and unknown-type frames must be rejected. To pick up a newer
+  hrpc-test release, copy its `fixtures/` over `testdata/hrpc-test/` and update
+  `VERSION`.
+- `interop_test.go` spawns `bare example/stream-server.js` and streams in both
+  directions against the real bare-rpc. Run with
+  `go test -tags interop ./...` after `npm i` in `example/` (requires `bare`).
 
 ## Transport
 

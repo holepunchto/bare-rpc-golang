@@ -6,9 +6,7 @@ import (
 	"sync"
 )
 
-// defaultHighWater is the number of buffered bytes on an IncomingStream that
-// triggers a PAUSE back to the remote writer. It mirrors bare-stream's default
-// readable high-water mark closely enough for compatible flow control.
+// defaultHighWater is the buffered byte count at which a reader pauses the remote writer.
 const defaultHighWater = 16 * 1024
 
 var (
@@ -16,14 +14,11 @@ var (
 	errStreamDestroyed = errors.New("rpc: stream destroyed")
 )
 
-// IncomingStream is the readable end of an RPC stream. It implements
-// io.ReadCloser. Data arrives via the connection's read loop (push); the
-// consumer drains it with Read. When buffered data crosses the high-water mark
-// a PAUSE is sent to the remote writer, and a RESUME once it drains again.
+// IncomingStream is the readable end of a stream; it pauses and resumes the remote writer as it buffers.
 type IncomingStream struct {
 	rpc  *RPC
 	id   uint
-	mask uint // StreamRequest or StreamResponse
+	mask uint
 
 	mu        sync.Mutex
 	cond      *sync.Cond
@@ -42,15 +37,17 @@ func newIncomingStream(rpc *RPC, id, mask uint) *IncomingStream {
 	return s
 }
 
-// open sends the OPEN acknowledgement that lets the remote writer start flowing.
 func (s *IncomingStream) open() error {
 	return s.rpc.sendStream(s.id, s.mask|StreamOpen, nil)
 }
 
-// push enqueues a DATA frame and pauses the remote writer if we're over budget.
+func (s *IncomingStream) done() bool {
+	return s.closed || s.ended || s.err != nil
+}
+
 func (s *IncomingStream) push(data []byte) {
 	s.mu.Lock()
-	if s.closed || s.ended || s.err != nil {
+	if s.done() {
 		s.mu.Unlock()
 		return
 	}
@@ -70,45 +67,67 @@ func (s *IncomingStream) push(data []byte) {
 	}
 }
 
-// pushEOF marks a graceful end; pending reads drain then return io.EOF.
 func (s *IncomingStream) pushEOF() {
 	s.mu.Lock()
+	if s.done() {
+		s.mu.Unlock()
+		return
+	}
 	s.ended = true
 	s.cond.Broadcast()
 	s.mu.Unlock()
+
+	s.rpc.incomingClosed(s.id, s.mask)
 }
 
-// destroyFromRemote aborts the stream because the writer signalled CLOSE|ERROR.
-func (s *IncomingStream) destroyFromRemote(err error) {
+// abort fails the stream; buffered data stays readable, then reads return err.
+func (s *IncomingStream) abort(err error) {
 	s.mu.Lock()
-	if s.err == nil {
-		if err != nil {
-			s.err = err
-		} else {
-			s.err = errStreamDestroyed
-		}
+	if s.done() {
+		s.mu.Unlock()
+		return
 	}
+	if err == nil {
+		err = errStreamDestroyed
+	}
+	s.err = err
 	s.cond.Broadcast()
 	s.mu.Unlock()
+
+	s.rpc.incomingClosed(s.id, s.mask)
 }
 
-func (s *IncomingStream) Read(p []byte) (int, error) {
-	s.mu.Lock()
-	for len(s.queue) == 0 && !s.ended && !s.closed && s.err == nil {
+func (s *IncomingStream) wait() error {
+	for len(s.queue) == 0 && !s.done() {
 		s.cond.Wait()
 	}
+	if len(s.queue) > 0 {
+		return nil
+	}
+	if s.err != nil {
+		return s.err
+	}
+	if s.closed {
+		return errStreamClosed
+	}
+	return io.EOF
+}
 
-	if len(s.queue) == 0 {
-		err := s.err
-		closed := s.closed
+func (s *IncomingStream) consumed(n int) bool {
+	s.buffered -= n
+	resume := s.paused && s.buffered < s.highWater && !s.done()
+	if resume {
+		s.paused = false
+	}
+	return resume
+}
+
+// Read implements io.Reader over the stream's bytes without preserving frame boundaries.
+func (s *IncomingStream) Read(p []byte) (int, error) {
+	s.mu.Lock()
+	if err := s.wait(); err != nil {
 		s.mu.Unlock()
-		if err != nil {
-			return 0, err
-		}
-		if closed {
-			return 0, errStreamClosed
-		}
-		return 0, io.EOF
+		return 0, err
 	}
 
 	chunk := s.queue[0]
@@ -118,12 +137,7 @@ func (s *IncomingStream) Read(p []byte) (int, error) {
 	} else {
 		s.queue = s.queue[1:]
 	}
-	s.buffered -= n
-
-	resume := s.paused && s.buffered < s.highWater
-	if resume {
-		s.paused = false
-	}
+	resume := s.consumed(n)
 	s.mu.Unlock()
 
 	if resume {
@@ -132,31 +146,60 @@ func (s *IncomingStream) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// Close tears down the readable end and signals the remote writer via DESTROY.
+// ReadChunk returns the next DATA frame whole, or io.EOF after a graceful end.
+func (s *IncomingStream) ReadChunk() ([]byte, error) {
+	s.mu.Lock()
+	if err := s.wait(); err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
+
+	chunk := s.queue[0]
+	s.queue = s.queue[1:]
+	resume := s.consumed(len(chunk))
+	s.mu.Unlock()
+
+	if resume {
+		s.rpc.sendStream(s.id, s.mask|StreamResume, nil)
+	}
+	return chunk, nil
+}
+
+// Close stops reading and sends DESTROY to the remote writer.
 func (s *IncomingStream) Close() error {
+	return s.Destroy(nil)
+}
+
+// Destroy stops reading and sends DESTROY|ERROR carrying cause (bare DESTROY when nil).
+func (s *IncomingStream) Destroy(cause error) error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		return nil
 	}
 	s.closed = true
+	aborted := s.err != nil
 	s.cond.Broadcast()
 	s.mu.Unlock()
 
-	s.rpc.removeIncoming(s.id, s.mask)
+	s.rpc.incomingClosed(s.id, s.mask)
+
+	if aborted {
+		return nil
+	}
+	if cause != nil {
+		return s.rpc.sendStreamError(s.id, s.mask|StreamDestroy, cause)
+	}
 	return s.rpc.sendStream(s.id, s.mask|StreamDestroy, nil)
 }
 
-// OutgoingStream is the writable end of an RPC stream. It implements
-// io.WriteCloser. The first Write blocks until the remote reader has
-// acknowledged the OPEN handshake; subsequent writes block while the remote
-// reader has us paused (cork/uncork).
+// OutgoingStream is the writable end of a stream; writes wait for the OPEN ack and honour remote pauses.
 type OutgoingStream struct {
 	rpc     *RPC
 	id      uint
 	command uint
-	typ     uint // TypeRequest or TypeResponse, used for the OPEN frame
-	mask    uint // StreamRequest or StreamResponse
+	typ     uint
+	mask    uint
 
 	mu     sync.Mutex
 	cond   *sync.Cond
@@ -172,9 +215,6 @@ func newOutgoingStream(rpc *RPC, id, command, typ, mask uint) *OutgoingStream {
 	return s
 }
 
-// open kicks off the handshake by sending a bare OPEN on a REQUEST/RESPONSE
-// frame. The matching reader replies with mask|OPEN, which lands in
-// continueOpen and unblocks writes.
 func (s *OutgoingStream) open() error {
 	switch s.typ {
 	case TypeRequest:
@@ -205,21 +245,24 @@ func (s *OutgoingStream) uncork() {
 	s.mu.Unlock()
 }
 
-// destroyFromRemote aborts the writer because the reader sent DESTROY.
-func (s *OutgoingStream) destroyFromRemote(err error) {
+func (s *OutgoingStream) abort(err error) {
 	s.mu.Lock()
-	if s.err == nil {
-		if err != nil {
-			s.err = err
-		} else {
-			s.err = errStreamDestroyed
-		}
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	if err == nil {
+		err = errStreamDestroyed
 	}
 	s.closed = true
+	s.err = err
 	s.cond.Broadcast()
 	s.mu.Unlock()
+
+	s.rpc.outgoingClosed(s.id, s.mask)
 }
 
+// Write sends p as one DATA frame, blocking while the stream is unopened or paused.
 func (s *OutgoingStream) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	for {
@@ -239,7 +282,6 @@ func (s *OutgoingStream) Write(p []byte) (int, error) {
 	}
 	s.mu.Unlock()
 
-	// Copy: Send encodes synchronously, but the caller may reuse p afterwards.
 	data := make([]byte, len(p))
 	copy(data, p)
 	if err := s.rpc.sendStream(s.id, s.mask|StreamData, data); err != nil {
@@ -248,7 +290,7 @@ func (s *OutgoingStream) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Close ends the stream gracefully: END (flush) followed by CLOSE (teardown).
+// Close ends the stream gracefully with END then CLOSE.
 func (s *OutgoingStream) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -256,21 +298,17 @@ func (s *OutgoingStream) Close() error {
 		return nil
 	}
 	s.closed = true
-	err := s.err
 	s.cond.Broadcast()
 	s.mu.Unlock()
 
-	s.rpc.removeOutgoing(s.id, s.mask)
-	if err != nil {
+	s.rpc.outgoingClosed(s.id, s.mask)
+	if err := s.rpc.sendStream(s.id, s.mask|StreamEnd, nil); err != nil {
 		return err
-	}
-	if e := s.rpc.sendStream(s.id, s.mask|StreamEnd, nil); e != nil {
-		return e
 	}
 	return s.rpc.sendStream(s.id, s.mask|StreamClose, nil)
 }
 
-// Destroy aborts the stream, signalling the remote reader with CLOSE|ERROR.
+// Destroy aborts the stream, sending CLOSE|ERROR carrying cause (bare CLOSE when nil).
 func (s *OutgoingStream) Destroy(cause error) error {
 	s.mu.Lock()
 	if s.closed {
@@ -278,13 +316,11 @@ func (s *OutgoingStream) Destroy(cause error) error {
 		return nil
 	}
 	s.closed = true
-	if s.err == nil {
-		s.err = errStreamDestroyed
-	}
+	s.err = errStreamDestroyed
 	s.cond.Broadcast()
 	s.mu.Unlock()
 
-	s.rpc.removeOutgoing(s.id, s.mask)
+	s.rpc.outgoingClosed(s.id, s.mask)
 	if cause != nil {
 		return s.rpc.sendStreamError(s.id, s.mask|StreamClose, cause)
 	}

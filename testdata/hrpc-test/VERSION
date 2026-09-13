@@ -1,0 +1,7 @@
+Wire-conformance fixtures vendored from hrpc-test 0.2.3
+(https://github.com/holepunchto/hrpc-test, commit 0af0ea1).
+
+Only the bare-rpc framing families are kept here (envelope, error, boundary,
+negative, sequence). The dispatch families belong to hrpc and live in hrpc-golang.
+
+Regenerate by copying fixtures/ from a newer hrpc-test release.
