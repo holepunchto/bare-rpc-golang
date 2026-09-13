@@ -316,6 +316,11 @@ behind the shim (or honours `BARE=/path/to/bare`).
 cd example && go run ./pipe
 ```
 
+The `ipc` package holds the two helpers this needs: `ipc.Socketpair()` for a
+Go parent, and `ipc.Inherited(fd)` for a Go child that Bare spawned with
+`bare-subprocess` and `stdio: ['inherit', 'inherit', 'inherit', 'pipe']`, which
+puts a duplex pipe on `subprocess.stdio[3]` and fd 3 in the child.
+
 The example creates a TUI application that fetches a list of items from the JavaScript server and displays them using [Bubble Tea](https://github.com/charmbracelet/bubbletea).
 
 ## Wire Compatibility

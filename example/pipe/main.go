@@ -14,13 +14,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	bare_rpc "github.com/holepunchto/bare-rpc-golang"
+	"github.com/holepunchto/bare-rpc-golang/ipc"
 )
 
 func main() {
-	parent, child, err := socketpair()
+	parent, child, err := ipc.Socketpair()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -85,18 +85,4 @@ func bareBinary() (string, error) {
 		return "", fmt.Errorf("resolving bare runtime behind %s: %w", shim, err)
 	}
 	return strings.TrimSpace(string(out)), nil
-}
-
-// socketpair returns both ends of a connected AF_UNIX stream pair as files.
-func socketpair() (*os.File, *os.File, error) {
-	syscall.ForkLock.RLock()
-	defer syscall.ForkLock.RUnlock()
-
-	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
-	if err != nil {
-		return nil, nil, err
-	}
-	syscall.CloseOnExec(fds[0])
-	syscall.CloseOnExec(fds[1])
-	return os.NewFile(uintptr(fds[0]), "ipc-parent"), os.NewFile(uintptr(fds[1]), "ipc-child"), nil
 }
