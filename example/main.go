@@ -6,15 +6,16 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"os/exec"
 	"syscall"
 	"time"
 
 	bare_rpc "github.com/holepunchto/bare-rpc-golang"
+	"github.com/holepunchto/bare-rpc-golang/ipc"
 	c "github.com/holepunchto/compact-encoding-golang"
 )
 
@@ -36,7 +37,12 @@ func main() {
 	}
 	defer syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 
-	conn := dial(socketPath)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := ipc.Dial(ctx, "unix", socketPath)
+	if err != nil {
+		log.Fatal(err)
+	}
 	defer conn.Close()
 
 	rpc := bare_rpc.NewRPC(conn)
@@ -59,19 +65,4 @@ func main() {
 		log.Fatalf("request 42: %v", err)
 	}
 	fmt.Printf("\ncommand 42 replied: %s\n", buf)
-}
-
-// dial retries until the JavaScript side has bound the socket.
-func dial(socketPath string) net.Conn {
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		conn, err := net.Dial("unix", socketPath)
-		if err == nil {
-			return conn
-		}
-		if time.Now().After(deadline) {
-			log.Fatalf("dial error: %v", err)
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
 }

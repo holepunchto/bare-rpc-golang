@@ -316,8 +316,9 @@ behind the shim (or honours `BARE=/path/to/bare`).
 cd example && go run ./pipe
 ```
 
-The `ipc` package holds the two helpers this needs: `ipc.Socketpair()` for a
-Go parent, and `ipc.Inherited(fd)` for a Go child that Bare spawned with
+The `ipc` package holds the transport helpers: `ipc.Dial(ctx, network, address)`
+retries until a server that is still starting up (a Bare sidecar you just
+spawned) accepts, `ipc.Socketpair()` is for a Go parent, and `ipc.Inherited(fd)` for a Go child that Bare spawned with
 `bare-subprocess` and `stdio: ['inherit', 'inherit', 'inherit', 'pipe']`, which
 puts a duplex pipe on `subprocess.stdio[3]` and fd 3 in the child.
 

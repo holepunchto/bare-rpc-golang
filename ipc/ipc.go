@@ -7,10 +7,12 @@
 package ipc
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
 	"syscall"
+	"time"
 )
 
 // Inherited wraps a descriptor handed down by the parent process as a net.Conn.
@@ -36,4 +38,21 @@ func Socketpair() (parent, child *os.File, err error) {
 	syscall.CloseOnExec(fds[0])
 	syscall.CloseOnExec(fds[1])
 	return os.NewFile(uintptr(fds[0]), "ipc-parent"), os.NewFile(uintptr(fds[1]), "ipc-child"), nil
+}
+
+// Dial connects like net.Dial but keeps retrying until ctx is done, for a server that is still
+// starting up, such as a Bare sidecar this process just spawned.
+func Dial(ctx context.Context, network, address string) (net.Conn, error) {
+	var dialer net.Dialer
+	for {
+		conn, err := dialer.DialContext(ctx, network, address)
+		if err == nil {
+			return conn, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("ipc: dial %s %s: %w (last error: %v)", network, address, ctx.Err(), err)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
