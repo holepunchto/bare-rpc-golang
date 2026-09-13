@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"syscall"
 	"time"
 
 	bare_rpc "github.com/holepunchto/bare-rpc-golang"
@@ -29,10 +30,11 @@ func main() {
 	cmd := exec.Command("bare", "server.js", socketPath)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // the npm bare shim respawns the runtime; kill both
 	if err := cmd.Start(); err != nil {
 		log.Fatalf("failed to start bare: %v", err)
 	}
-	defer cmd.Process.Kill()
+	defer syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 
 	conn := dial(socketPath)
 	defer conn.Close()
