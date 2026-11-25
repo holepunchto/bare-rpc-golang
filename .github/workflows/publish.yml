@@ -1,0 +1,16 @@
+name: Publish
+on:
+  push:
+    tags:
+      - v*
+permissions:
+  contents: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    name: Publish
+    steps:
+      - uses: holepunchto/actions/go-base@v1
+      - uses: holepunchto/actions/publish-go@v1

@@ -1,557 +1,749 @@
-package bare_rpc
+// Package barerpc is RPC over any byte transport, the Go counterpart of
+// bare-rpc and wire compatible with it. It sends requests, events, and
+// streams in both directions over one transport.
+package barerpc
 
 import (
+	"context"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
-	"sync/atomic"
-
-	c "github.com/holepunchto/compact-encoding-golang"
 )
 
-// ErrChannelClosed fails pending work when the transport closes cleanly (bare-rpc's CHANNEL_CLOSED).
-var ErrChannelClosed = &RPCError{Message: "Channel closed", Code: "CHANNEL_CLOSED"}
+// The defaults of Options.
+const (
+	DefaultMaxFrameSize     = 16 * 1024 * 1024
+	DefaultMaxBufferedBytes = 16 * 1024 * 1024
+)
 
-// ErrEventReply is returned when replying to an event, which has no reply slot.
-var ErrEventReply = errors.New("rpc: events cannot be replied to")
+// The most response streams that the remote end may open before their request
+// arrives, as bare-rpc allows.
+const maxPendingResponses = 1024
 
-// ErrFrameTooLarge tears the channel down when a frame exceeds MaxFrameSize.
-var ErrFrameTooLarge = errors.New("rpc: frame exceeds MaxFrameSize")
+// Options configures New. The zero value holds the defaults.
+type Options struct {
+	// Handler handles the requests and events of the remote end. Defaults to
+	// rejecting every request with UNKNOWN_COMMAND and dropping every event.
+	Handler Handler
+	// MaxFrameSize is the largest frame that the remote end may send,
+	// including its 4-byte length. Zero means DefaultMaxFrameSize.
+	MaxFrameSize int
+	// MaxBufferedBytes is the most that an incoming stream may buffer before
+	// the remote end is deemed to ignore its pauses. Zero means
+	// DefaultMaxBufferedBytes.
+	MaxBufferedBytes int
+}
 
-var errNoReply = errors.New("rpc: no unary reply: response was streamed")
-
-// DefaultMaxFrameSize caps what an untrusted length prefix can make Receive allocate.
-const DefaultMaxFrameSize = 16 << 20
-
-// RPC multiplexes requests, events and streams over one io.ReadWriter.
+// An RPC is one end of an RPC channel over a transport.
+//
+// The channel ends when the transport ends or fails, when the remote end
+// breaks the protocol, or when Close is called. Everything still in flight
+// then fails: Requests in flight fail with the cause, their streams are
+// destroyed, and the contexts of running handlers are cancelled with it.
 type RPC struct {
-	stream io.ReadWriter
+	transport        io.ReadWriteCloser
+	handler          Handler
+	maxFrameSize     int
+	maxBufferedBytes int
 
-	// MaxFrameSize is the largest frame body Receive accepts; set before Listen.
-	MaxFrameSize uint
+	reading chan struct{}
+	writing chan struct{}
 
-	mu      sync.Mutex // request ids, closed flag and the registries below
-	writeMu sync.Mutex // serializes frame writes, separate so reads never wait on a slow write
+	closeOnce sync.Once
+	closeErr  error
 
-	id           uint
-	messageCodec *MessageCodec
+	mu   sync.Mutex
+	cond *sync.Cond
 
-	closed   bool
-	closeErr error
+	closed bool
+	err    error
 
-	pending map[uint]chan *Message // unary replies; closed, never sent on, when no reply can come
+	queue   [][]byte
+	queued  uint64
+	written uint64
 
-	// Registries keyed by request id; the direction mask picks the map, the local role picks incoming or outgoing.
-	outgoingRequests  map[uint]*OutgoingStream
-	outgoingResponses map[uint]*OutgoingStream
-	incomingRequests  map[uint]*IncomingStream
-	incomingResponses map[uint]*IncomingStream
+	id uint
 
-	// OPEN acks that arrived before the local writer registered (bare-rpc's _pendingRequests/_pendingResponses).
-	pendingOpenRequests  map[uint]bool
-	pendingOpenResponses map[uint]bool
+	// The requests of this end, by id, that may still receive messages.
+	outgoingRequests  map[uint]*OutgoingRequest
+	incomingResponses map[uint]*OutgoingRequest
+
+	// The requests of the remote end, by id, that may still receive messages.
+	unansweredRequests map[uint]*Request
+	incomingRequests   map[uint]*Request
+	outgoingResponses  map[uint]*Request
+	pendingResponses   map[uint]bool
+	highestRequestID   uint
+
+	// The requests and events of the remote end whose handlers are running,
+	// and the requests among them by id, which a cancel still reaches once
+	// they have been answered.
+	handling map[aborter]bool
+	running  map[uint]*Request
 }
 
-// NewRPC wraps a transport. Run Listen to dispatch what arrives on it.
-func NewRPC(stream io.ReadWriter) *RPC {
-	return &RPC{
-		stream:            stream,
-		MaxFrameSize:      DefaultMaxFrameSize,
-		messageCodec:      NewMessageCodec(),
-		pending:           make(map[uint]chan *Message),
-		outgoingRequests:  make(map[uint]*OutgoingStream),
-		outgoingResponses: make(map[uint]*OutgoingStream),
-		incomingRequests:  make(map[uint]*IncomingStream),
-		incomingResponses: make(map[uint]*IncomingStream),
-
-		pendingOpenRequests:  make(map[uint]bool),
-		pendingOpenResponses: make(map[uint]bool),
-	}
+type aborter interface {
+	abort(reason error)
 }
 
-// Idle reports whether nothing is in flight: no pending reply and no open stream.
-func (r *RPC) Idle() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.pending) == 0 &&
-		len(r.outgoingRequests) == 0 &&
-		len(r.outgoingResponses) == 0 &&
-		len(r.incomingRequests) == 0 &&
-		len(r.incomingResponses) == 0 &&
-		len(r.pendingOpenRequests) == 0 &&
-		len(r.pendingOpenResponses) == 0
-}
+// New starts an RPC channel over transport, which it reads and writes until
+// the channel ends. A nil opts holds the defaults.
+func New(transport io.ReadWriteCloser, opts *Options) *RPC {
+	var o Options
 
-// Send encodes and writes one frame. It fails fast once the channel is closed.
-func (r *RPC) Send(m *Message) error {
-	r.mu.Lock()
-	closed, closeErr := r.closed, r.closeErr
-	r.mu.Unlock()
-	if closed {
-		return closeErr
+	if opts != nil {
+		o = *opts
 	}
 
-	buf, err := c.Encode(r.messageCodec, m)
-	if err != nil {
-		return err
+	if o.Handler == nil {
+		o.Handler = &Router{}
 	}
 
-	r.writeMu.Lock()
-	defer r.writeMu.Unlock()
-
-	_, err = r.stream.Write(buf)
-	return err
-}
-
-func (r *RPC) sendStream(id, flags uint, data []byte) error {
-	return r.Send(&Message{Type: TypeStream, ID: id, Stream: flags, Data: data})
-}
-
-func (r *RPC) sendStreamError(id, flags uint, cause error) error {
-	return r.Send(&Message{Type: TypeStream, ID: id, Stream: flags | StreamError, Error: toRPCError(cause)})
-}
-
-// toRPCError keeps a (wrapped) RPCError's code and errno; any other error crosses the wire as its message.
-func toRPCError(err error) *RPCError {
-	var rpcErr *RPCError
-	if errors.As(err, &rpcErr) {
-		return rpcErr
-	}
-	return &RPCError{Message: err.Error()}
-}
-
-// Receive reads and decodes one frame.
-func (r *RPC) Receive() (*Message, error) {
-	lenBuf := make([]byte, 4)
-	if _, err := io.ReadFull(r.stream, lenBuf); err != nil {
-		return nil, err
+	if o.MaxFrameSize <= 0 {
+		o.MaxFrameSize = DefaultMaxFrameSize
 	}
 
-	frameLen := uint(lenBuf[0]) |
-		uint(lenBuf[1])<<8 |
-		uint(lenBuf[2])<<16 |
-		uint(lenBuf[3])<<24
-
-	if frameLen > r.MaxFrameSize {
-		return nil, ErrFrameTooLarge
+	if o.MaxBufferedBytes <= 0 {
+		o.MaxBufferedBytes = DefaultMaxBufferedBytes
 	}
 
-	buf := make([]byte, 4+frameLen)
-	copy(buf, lenBuf)
-	if _, err := io.ReadFull(r.stream, buf[4:]); err != nil {
-		return nil, err
+	r := &RPC{
+		transport:          transport,
+		handler:            o.Handler,
+		maxFrameSize:       o.MaxFrameSize,
+		maxBufferedBytes:   o.MaxBufferedBytes,
+		reading:            make(chan struct{}),
+		writing:            make(chan struct{}),
+		outgoingRequests:   make(map[uint]*OutgoingRequest),
+		incomingResponses:  make(map[uint]*OutgoingRequest),
+		unansweredRequests: make(map[uint]*Request),
+		incomingRequests:   make(map[uint]*Request),
+		outgoingResponses:  make(map[uint]*Request),
+		pendingResponses:   make(map[uint]bool),
+		handling:           make(map[aborter]bool),
+		running:            make(map[uint]*Request),
 	}
 
-	state := c.NewState()
-	state.Buffer = buf
-	state.End = uint(len(buf))
+	r.cond = sync.NewCond(&r.mu)
 
-	return r.messageCodec.Decode(state)
+	go r.read()
+	go r.write()
+
+	return r
 }
 
-// Request sends a unary request and waits for its reply.
-func (r *RPC) Request(command uint, data []byte) ([]byte, error) {
-	req := r.NewRequest(command)
+// Request sends a request and waits for its reply. If ctx is done first, the
+// request is cancelled and fails with a CANCELLED or TIMEOUT *Error that
+// wraps the context error.
+func (r *RPC) Request(ctx context.Context, command uint, data []byte) ([]byte, error) {
+	req := r.NewRequest(ctx, command)
+
 	if err := req.Send(data); err != nil {
-		r.mu.Lock()
-		delete(r.pending, req.id)
-		r.mu.Unlock()
 		return nil, err
 	}
+
 	return req.Reply()
 }
 
-// Event sends a one-way request (id 0) that gets no reply.
+// Event sends an event, which gets no reply.
 func (r *RPC) Event(command uint, data []byte) error {
-	return r.Send(&Message{Type: TypeRequest, ID: 0, Command: command, Data: data})
-}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-// Reply sends a unary response.
-func (r *RPC) Reply(id uint, data []byte) error {
-	return r.Send(&Message{Type: TypeResponse, ID: id, Data: data})
-}
-
-// ReplyError sends an error response; see toRPCError for what crosses the wire.
-func (r *RPC) ReplyError(id uint, err error) error {
-	return r.Send(&Message{Type: TypeResponse, ID: id, Error: toRPCError(err)})
-}
-
-// Request is an incoming request or event as handed to the Listen handler.
-type Request struct {
-	*Message
-	rpc  *RPC
-	sent atomic.Bool
-}
-
-// IsEvent reports whether this is a one-way event (id 0).
-func (r *Request) IsEvent() bool {
-	return r.ID == 0
-}
-
-// Reply sends the unary response.
-func (r *Request) Reply(data []byte) error {
-	if r.IsEvent() {
-		return ErrEventReply
+	if r.closed {
+		return r.err
 	}
-	r.sent.Store(true)
-	return r.rpc.Reply(r.ID, data)
-}
 
-// ReplyError sends an error response.
-func (r *Request) ReplyError(err error) error {
-	if r.IsEvent() {
-		return ErrEventReply
-	}
-	r.sent.Store(true)
-	return r.rpc.ReplyError(r.ID, err)
-}
+	r.enqueue(&message{typ: typeRequest, command: command, data: data})
 
-// CreateRequestStream opens the readable request stream (initiator -> handler).
-func (r *Request) CreateRequestStream() *IncomingStream {
-	s := newIncomingStream(r.rpc, r.ID, StreamRequest)
-	r.rpc.openIncoming(s)
-	return s
-}
-
-// CreateResponseStream opens the writable response stream (handler -> initiator).
-func (r *Request) CreateResponseStream() *OutgoingStream {
-	r.sent.Store(true)
-	s := newOutgoingStream(r.rpc, r.ID, r.Command, TypeResponse, StreamResponse)
-	r.rpc.openOutgoing(s)
-	return s
-}
-
-// Listen dispatches frames until the transport ends or fails, then fails everything still in flight.
-//
-// onRequest runs on its own goroutine per request or event. An error it returns becomes the
-// error reply unless a reply was already started; for an event it fails the channel instead.
-// A clean end reaches waiters as ErrChannelClosed while Listen itself returns io.EOF.
-func (r *RPC) Listen(onRequest func(req *Request) error) error {
-	for {
-		msg, err := r.Receive()
-		if err != nil {
-			cause := err
-			if err == io.EOF {
-				cause = ErrChannelClosed
-			}
-			r.teardown(cause)
-			return err
-		}
-
-		switch msg.Type {
-		case TypeRequest:
-			if onRequest != nil {
-				go r.handle(&Request{Message: msg, rpc: r}, onRequest)
-			}
-
-		case TypeResponse:
-			r.onResponse(msg)
-
-		case TypeStream:
-			r.onStream(msg)
-		}
-	}
-}
-
-func (r *RPC) handle(req *Request, onRequest func(*Request) error) {
-	err := onRequest(req)
-	if err == nil {
-		return
-	}
-	if req.IsEvent() {
-		r.fail(err)
-		return
-	}
-	if !req.sent.Load() {
-		req.ReplyError(err)
-	}
-}
-
-// Close fails everything in flight with ErrChannelClosed and closes the transport when it is an io.Closer.
-func (r *RPC) Close() error {
-	r.teardown(ErrChannelClosed)
-	if closer, ok := r.stream.(io.Closer); ok {
-		return closer.Close()
-	}
 	return nil
 }
 
-// fail tears down from our side and closes the transport when it can be closed.
-func (r *RPC) fail(err error) {
-	r.teardown(err)
-	if closer, ok := r.stream.(io.Closer); ok {
-		closer.Close()
+// Idle reports whether nothing is in flight, so that the transport can be
+// closed without failing anything.
+func (r *RPC) Idle() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return len(r.outgoingRequests) == 0 &&
+		len(r.outgoingResponses) == 0 &&
+		len(r.incomingRequests) == 0 &&
+		len(r.incomingResponses) == 0 &&
+		len(r.pendingResponses) == 0
+}
+
+// Close ends the channel, failing everything in flight with ErrChannelClosed.
+// It writes what was sent before it was called, closes the transport, and
+// waits for the channel to end.
+func (r *RPC) Close() error {
+	r.teardown(ErrChannelClosed)
+
+	<-r.writing
+	<-r.reading
+
+	return r.closeErr
+}
+
+// Wait waits for the channel to end. It returns nil if the channel closed
+// cleanly, and otherwise the error that ended it.
+func (r *RPC) Wait() error {
+	<-r.writing
+	<-r.reading
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.err == ErrChannelClosed {
+		return nil
+	}
+
+	return r.err
+}
+
+func (r *RPC) closeTransport() {
+	r.closeOnce.Do(func() {
+		r.closeErr = r.transport.Close()
+	})
+}
+
+// Queues a message for the writer, unless the channel has ended, and returns
+// its sequence number for waitWritten. Must be called with r.mu held.
+func (r *RPC) enqueue(m *message) uint64 {
+	if r.closed {
+		return 0
+	}
+
+	r.queue = append(r.queue, encodeFrame(m))
+	r.queued++
+	r.cond.Broadcast()
+
+	return r.queued
+}
+
+// Waits for a queued message to be written, or for the channel to end. Must
+// be called with r.mu held.
+func (r *RPC) waitWritten(seq uint64) {
+	for r.written < seq && !r.closed {
+		r.cond.Wait()
 	}
 }
 
-func (r *RPC) teardown(cause error) {
+// Messages are written by a goroutine of their own, so that the reader never
+// blocks on writing. Once the channel ends cleanly, what was queued is still
+// written before the transport is closed.
+func (r *RPC) write() {
+	defer close(r.writing)
+	defer r.closeTransport()
+
 	r.mu.Lock()
-	if r.closed {
+
+	for {
+		for len(r.queue) == 0 && !r.closed {
+			r.cond.Wait()
+		}
+
+		if len(r.queue) == 0 {
+			r.mu.Unlock()
+
+			return
+		}
+
+		queue := r.queue
+		r.queue = nil
+
 		r.mu.Unlock()
+
+		for _, frame := range queue {
+			if _, err := r.transport.Write(frame); err != nil {
+				r.fail(err)
+
+				return
+			}
+		}
+
+		r.mu.Lock()
+
+		r.written += uint64(len(queue))
+		r.cond.Broadcast()
+	}
+}
+
+func (r *RPC) read() {
+	defer close(r.reading)
+
+	for {
+		body, err := r.readFrame()
+		if err != nil {
+			if err == io.EOF {
+				err = ErrChannelClosed
+			}
+
+			r.teardown(err)
+
+			return
+		}
+
+		m, err := decodeBody(body)
+		if err != nil {
+			r.fail(err)
+		} else {
+			r.onMessage(m)
+		}
+	}
+}
+
+func (r *RPC) readFrame() ([]byte, error) {
+	var header [4]byte
+
+	if _, err := io.ReadFull(r.transport, header[:]); err != nil {
+		if err == io.ErrUnexpectedEOF {
+			err = newError(CodeInvalidMessage, "Truncated frame")
+		}
+
+		return nil, err
+	}
+
+	size := 4 + int64(binary.LittleEndian.Uint32(header[:]))
+
+	if size > int64(r.maxFrameSize) {
+		return nil, newError(CodeFrameTooLarge, fmt.Sprintf("Frame of %d bytes exceeds the limit of %d bytes", size, r.maxFrameSize))
+	}
+
+	body := make([]byte, size-4)
+
+	if _, err := io.ReadFull(r.transport, body); err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			err = newError(CodeInvalidMessage, "Truncated frame")
+		}
+
+		return nil, err
+	}
+
+	return body, nil
+}
+
+// Ends the channel because of a failure, without writing what is queued.
+func (r *RPC) fail(err error) {
+	r.teardown(err)
+	r.closeTransport()
+}
+
+func (r *RPC) teardown(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.closed {
 		return
 	}
+
 	r.closed = true
-	r.closeErr = cause
+	r.err = err
 
-	pending := r.pending
-	r.pending = make(map[uint]chan *Message)
+	if err != ErrChannelClosed {
+		r.queue = nil
+	}
 
-	var outgoing []*OutgoingStream
-	var incoming []*IncomingStream
-	for _, s := range r.outgoingRequests {
-		outgoing = append(outgoing, s)
+	for _, req := range r.outgoingRequests {
+		req.detach()
+
+		if req.responseStream == nil {
+			req.settle(nil, err)
+		}
 	}
-	for _, s := range r.outgoingResponses {
-		outgoing = append(outgoing, s)
+
+	for _, req := range r.unansweredRequests {
+		req.abort(err)
 	}
-	for _, s := range r.incomingRequests {
-		incoming = append(incoming, s)
+
+	for a := range r.handling {
+		a.abort(err)
 	}
-	for _, s := range r.incomingResponses {
-		incoming = append(incoming, s)
+
+	for _, req := range r.incomingRequests {
+		req.abort(err)
 	}
+
+	for _, req := range r.outgoingResponses {
+		req.abort(err)
+	}
+
+	var (
+		outgoing []*OutgoingStream
+		incoming []*IncomingStream
+	)
+
+	for _, req := range r.outgoingRequests {
+		if req.requestStream != nil {
+			outgoing = append(outgoing, req.requestStream)
+		}
+	}
+
+	for _, req := range r.outgoingResponses {
+		outgoing = append(outgoing, req.responseStream)
+	}
+
+	for _, req := range r.incomingRequests {
+		incoming = append(incoming, req.requestStream)
+	}
+
+	for _, req := range r.incomingResponses {
+		incoming = append(incoming, req.responseStream)
+	}
+
 	clear(r.outgoingRequests)
 	clear(r.outgoingResponses)
 	clear(r.incomingRequests)
 	clear(r.incomingResponses)
-	clear(r.pendingOpenRequests)
-	clear(r.pendingOpenResponses)
-	r.mu.Unlock()
+	clear(r.pendingResponses)
+	clear(r.unansweredRequests)
 
-	for _, ch := range pending {
-		close(ch)
-	}
 	for _, s := range outgoing {
-		s.abort(cause)
+		s.destroy(err)
 	}
+
 	for _, s := range incoming {
-		s.abort(cause)
+		s.destroy(err)
 	}
+
+	r.cond.Broadcast()
 }
 
-func (r *RPC) noReplyError() error {
+func (r *RPC) onMessage(m *message) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+
 	if r.closed {
-		return r.closeErr
-	}
-	return errNoReply
-}
+		r.mu.Unlock()
 
-func (r *RPC) onResponse(msg *Message) {
-	if msg.ID == 0 {
-		return
-	}
-	// A response with a stream flag is the response-stream OPEN signal, not a reply.
-	if msg.Error == nil && msg.Stream != 0 {
 		return
 	}
 
-	r.mu.Lock()
-	ch, ok := r.pending[msg.ID]
-	delete(r.pending, msg.ID)
-	var rs *IncomingStream
-	var ws *OutgoingStream
-	if msg.Error != nil {
-		rs = r.incomingResponses[msg.ID]
-		ws = r.outgoingRequests[msg.ID]
+	var err error
+
+	switch m.typ {
+	case typeRequest:
+		err = r.onRequest(m)
+	case typeResponse:
+		r.onResponse(m)
+	case typeStream:
+		err = r.onStream(m)
+	case typeCancel:
+		r.onCancel(m)
 	}
+
 	r.mu.Unlock()
 
-	if ok {
-		ch <- msg
-	}
-	// An error reply settles the whole request, streams included.
-	if rs != nil {
-		rs.abort(msg.Error)
-	}
-	if ws != nil {
-		ws.abort(msg.Error)
+	if err != nil {
+		r.fail(err)
 	}
 }
 
-func (r *RPC) onStream(msg *Message) {
-	if msg.ID == 0 {
+func (r *RPC) onRequest(m *message) error {
+	if r.unansweredRequests[m.id] != nil || r.incomingRequests[m.id] != nil || r.outgoingResponses[m.id] != nil {
+		return newError(CodeInvalidMessage, fmt.Sprintf("Request '%d' is already in flight", m.id))
+	}
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+
+	if m.id == 0 {
+		event := &Event{Command: m.command, Data: m.data, cancel: cancel}
+
+		r.handling[event] = true
+
+		go r.handleEvent(ctx, event)
+
+		return nil
+	}
+
+	req := &Request{
+		ID:      m.id,
+		Command: m.command,
+		Data:    m.data,
+		rpc:     r,
+		ex:      exchange{id: m.id, command: m.command},
+		cancel:  cancel,
+	}
+
+	r.unansweredRequests[m.id] = req
+	r.highestRequestID = max(r.highestRequestID, m.id)
+	r.handling[req] = true
+	r.running[m.id] = req
+
+	go r.handleRequest(ctx, req)
+
+	return nil
+}
+
+func (r *RPC) handleEvent(ctx context.Context, event *Event) {
+	err := r.handler.HandleEvent(ctx, event)
+
+	r.mu.Lock()
+	delete(r.handling, event)
+	r.mu.Unlock()
+
+	event.cancel(nil)
+
+	if err != nil {
+		r.fail(err)
+	}
+}
+
+func (r *RPC) handleRequest(ctx context.Context, req *Request) {
+	err := r.handler.HandleRequest(ctx, req)
+
+	r.mu.Lock()
+
+	delete(r.handling, req)
+
+	if r.running[req.ex.id] == req {
+		delete(r.running, req.ex.id)
+	}
+
+	if err != nil {
+		if req.responseStream != nil {
+			req.responseStream.destroy(err)
+		} else if !req.sent {
+			r.sendError(req, err)
+		}
+	}
+
+	r.mu.Unlock()
+
+	req.cancel(nil)
+}
+
+func (r *RPC) onResponse(m *message) {
+	req := r.outgoingRequests[m.id]
+
+	if req == nil {
 		return
 	}
 
 	switch {
-	case msg.Stream&StreamOpen != 0:
-		r.onStreamOpen(msg)
-	case msg.Stream&StreamClose != 0:
-		r.onStreamClose(msg)
-	case msg.Stream&StreamPause != 0:
-		r.onStreamPause(msg)
-	case msg.Stream&StreamResume != 0:
-		r.onStreamResume(msg)
-	case msg.Stream&StreamData != 0:
-		r.onStreamData(msg)
-	case msg.Stream&StreamEnd != 0:
-		r.onStreamEnd(msg)
-	case msg.Stream&StreamDestroy != 0:
-		r.onStreamDestroy(msg)
-	}
-}
+	case m.err != nil:
+		req.respond(nil, m.err)
 
-func (r *RPC) onStreamOpen(msg *Message) {
-	r.mu.Lock()
-	var s *OutgoingStream
-	if msg.Stream&StreamRequest != 0 {
-		if s = r.outgoingRequests[msg.ID]; s == nil {
-			r.pendingOpenRequests[msg.ID] = true
+		if req.responseStream != nil {
+			req.responseStream.destroy(m.err)
 		}
-	} else if msg.Stream&StreamResponse != 0 {
-		if s = r.outgoingResponses[msg.ID]; s == nil {
-			r.pendingOpenResponses[msg.ID] = true
+
+		req.releaseRequestStream(m.err)
+	case m.stream == 0:
+		req.respond(m.data, nil)
+
+		if s := req.responseStream; s != nil && s.pushable() {
+			if len(m.data) > 0 {
+				s.push(m.data)
+			}
+
+			s.pushEnd()
+		}
+
+		req.releaseRequestStream(nil)
+	case req.responseStream == nil:
+		err := newError(CodeUnexpectedStream, fmt.Sprintf("Request '%d' was answered with a stream", req.ex.id))
+
+		req.respond(nil, err)
+
+		r.enqueue(&message{typ: typeStream, id: m.id, stream: streamResponse | streamDestroy})
+
+		req.releaseRequestStream(err)
+	}
+}
+
+func (r *RPC) onCancel(m *message) {
+	req := r.unansweredRequests[m.id]
+
+	if req == nil {
+		req = r.incomingRequests[m.id]
+	}
+
+	if req == nil {
+		req = r.outgoingResponses[m.id]
+	}
+
+	// The response stream of a request may have closed just before its
+	// cancel arrived, as the remote end destroys the stream first, while
+	// its handler still runs.
+	if req == nil {
+		req = r.running[m.id]
+	}
+
+	if req == nil {
+		return
+	}
+
+	req.ex.cancelled = true
+
+	r.onAnswered(req)
+
+	req.abort(m.err)
+
+	if req.requestStream != nil {
+		req.requestStream.destroy(m.err)
+	}
+
+	if req.responseStream != nil {
+		req.responseStream.destroy(m.err)
+	}
+}
+
+func (r *RPC) onStream(m *message) error {
+	switch {
+	case m.stream&streamOpen != 0:
+		return r.onStreamOpen(m)
+	case m.stream&streamClose != 0:
+		if s := r.incomingStream(m); s != nil {
+			s.finish()
+
+			if m.err != nil {
+				s.destroy(m.err)
+			} else {
+				s.pushEnd()
+			}
+		}
+	case m.stream&streamPause != 0:
+		if s := r.outgoingStream(m); s != nil {
+			s.corked = true
+		}
+	case m.stream&streamResume != 0:
+		if s := r.outgoingStream(m); s != nil {
+			s.corked = false
+			r.cond.Broadcast()
+		}
+	case m.stream&streamData != 0:
+		return r.onStreamData(m)
+	case m.stream&streamEnd != 0:
+		if s := r.incomingStream(m); s != nil {
+			s.finish()
+			s.pushEnd()
+		}
+	case m.stream&streamDestroy != 0:
+		if m.stream&streamResponse != 0 {
+			delete(r.pendingResponses, m.id)
+		}
+
+		if s := r.outgoingStream(m); s != nil {
+			var err error
+
+			if m.err != nil {
+				err = m.err
+			}
+
+			s.destroy(err)
 		}
 	}
-	r.mu.Unlock()
 
-	if s != nil {
-		s.continueOpen()
-	}
-}
-
-func (r *RPC) openOutgoing(s *OutgoingStream) {
-	r.mu.Lock()
-	if r.closed {
-		err := r.closeErr
-		r.mu.Unlock()
-		s.abort(err)
-		return
-	}
-	var acked bool
-	if s.mask&StreamRequest != 0 {
-		r.outgoingRequests[s.id] = s
-		acked = r.pendingOpenRequests[s.id]
-		delete(r.pendingOpenRequests, s.id)
-	} else {
-		r.outgoingResponses[s.id] = s
-		acked = r.pendingOpenResponses[s.id]
-		delete(r.pendingOpenResponses, s.id)
-	}
-	r.mu.Unlock()
-
-	s.open()
-	if acked {
-		s.continueOpen()
-	}
-}
-
-func (r *RPC) openIncoming(s *IncomingStream) {
-	r.mu.Lock()
-	if r.closed {
-		err := r.closeErr
-		r.mu.Unlock()
-		s.abort(err)
-		return
-	}
-	if s.mask&StreamRequest != 0 {
-		r.incomingRequests[s.id] = s
-	} else {
-		r.incomingResponses[s.id] = s
-	}
-	r.mu.Unlock()
-
-	s.open()
-}
-
-func (r *RPC) onStreamClose(msg *Message) {
-	s := r.incomingStream(msg.ID, msg.Stream)
-	if s == nil {
-		return
-	}
-	if msg.Error != nil {
-		s.abort(msg.Error)
-	} else {
-		s.pushEOF()
-	}
-}
-
-func (r *RPC) onStreamPause(msg *Message) {
-	if s := r.outgoingStream(msg.ID, msg.Stream); s != nil {
-		s.cork()
-	}
-}
-
-func (r *RPC) onStreamResume(msg *Message) {
-	if s := r.outgoingStream(msg.ID, msg.Stream); s != nil {
-		s.uncork()
-	}
-}
-
-func (r *RPC) onStreamData(msg *Message) {
-	if s := r.incomingStream(msg.ID, msg.Stream); s != nil {
-		s.push(msg.Data)
-	}
-}
-
-func (r *RPC) onStreamEnd(msg *Message) {
-	if s := r.incomingStream(msg.ID, msg.Stream); s != nil {
-		s.pushEOF()
-	}
-}
-
-func (r *RPC) onStreamDestroy(msg *Message) {
-	s := r.outgoingStream(msg.ID, msg.Stream)
-	if s == nil {
-		return
-	}
-	var err error
-	if msg.Error != nil {
-		err = msg.Error
-	}
-	s.abort(err)
-}
-
-func (r *RPC) outgoingStream(id, flags uint) *OutgoingStream {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if flags&StreamRequest != 0 {
-		return r.outgoingRequests[id]
-	}
-	if flags&StreamResponse != 0 {
-		return r.outgoingResponses[id]
-	}
 	return nil
 }
 
-func (r *RPC) incomingStream(id, flags uint) *IncomingStream {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if flags&StreamRequest != 0 {
-		return r.incomingRequests[id]
+func (r *RPC) onStreamOpen(m *message) error {
+	if m.stream&streamRequest != 0 {
+		if s := r.outgoingStream(m); s != nil {
+			s.acknowledge()
+		}
+
+		return nil
 	}
-	if flags&StreamResponse != 0 {
-		return r.incomingResponses[id]
+
+	if req := r.outgoingResponses[m.id]; req != nil {
+		req.responseStream.acknowledge()
+
+		return nil
 	}
+
+	// The remote end opens its response stream as soon as it is created,
+	// which may be before its request arrives or before the handler here
+	// creates the response stream. The open is remembered until either
+	// happens, the request is answered, or the remote end destroys its
+	// stream. Any other open is for a request that has been answered.
+	if r.pendingResponses[m.id] {
+		return nil
+	}
+
+	if r.unansweredRequests[m.id] == nil && m.id <= r.highestRequestID {
+		return nil
+	}
+
+	if len(r.pendingResponses) >= maxPendingResponses {
+		return newError(CodeInvalidMessage, "Too many response streams opened early")
+	}
+
+	r.pendingResponses[m.id] = true
+
 	return nil
 }
 
-func (r *RPC) outgoingClosed(id, mask uint) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if mask&StreamRequest != 0 {
-		delete(r.outgoingRequests, id)
-	} else {
-		delete(r.outgoingResponses, id)
+func (r *RPC) onStreamData(m *message) error {
+	s := r.incomingStream(m)
+
+	if s == nil || !s.pushable() {
+		return nil
 	}
+
+	s.push(m.data)
+
+	if s.buffered > r.maxBufferedBytes {
+		return newError(CodeStreamOverflow, fmt.Sprintf("Stream buffered more than the limit of %d bytes", r.maxBufferedBytes))
+	}
+
+	if !s.paused && s.buffered >= highWaterMark {
+		s.paused = true
+
+		r.enqueue(&message{typ: typeStream, id: m.id, stream: s.mask | streamPause})
+	}
+
+	return nil
 }
 
-// incomingClosed forgets a reader; a finished response stream also settles the request it answered.
-func (r *RPC) incomingClosed(id, mask uint) {
-	r.mu.Lock()
-	var ch chan *Message
-	if mask&StreamRequest != 0 {
-		delete(r.incomingRequests, id)
-	} else {
-		delete(r.incomingResponses, id)
-		ch = r.pending[id]
-		delete(r.pending, id)
+func (r *RPC) incomingStream(m *message) *IncomingStream {
+	if m.stream&streamRequest != 0 {
+		if req := r.incomingRequests[m.id]; req != nil {
+			return req.requestStream
+		}
+	} else if req := r.incomingResponses[m.id]; req != nil {
+		return req.responseStream
 	}
-	r.mu.Unlock()
 
-	if ch != nil {
-		close(ch)
-	}
+	return nil
 }
+
+func (r *RPC) outgoingStream(m *message) *OutgoingStream {
+	if m.stream&streamRequest != 0 {
+		if req := r.outgoingRequests[m.id]; req != nil {
+			return req.requestStream
+		}
+	} else if req := r.outgoingResponses[m.id]; req != nil {
+		return req.responseStream
+	}
+
+	return nil
+}
+
+func (r *RPC) isUnanswered(req *Request) bool {
+	return r.unansweredRequests[req.ex.id] == req
+}
+
+// Returns whether the remote end had already opened its response stream.
+func (r *RPC) onAnswered(req *Request) bool {
+	delete(r.unansweredRequests, req.ex.id)
+
+	opened := r.pendingResponses[req.ex.id]
+
+	delete(r.pendingResponses, req.ex.id)
+
+	return opened
+}
+
+func (r *RPC) sendError(req *Request, err error) {
+	if !r.isUnanswered(req) {
+		return
+	}
+
+	r.onAnswered(req)
+
+	r.enqueue(&message{typ: typeResponse, id: req.ex.id, err: toError(err)})
+}
+
+var errNotSent = errors.New("barerpc: request has not been sent")
